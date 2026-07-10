@@ -668,6 +668,39 @@
                     "null"
                   ]
                 },
+                "pane_id": {
+                  "type": "string"
+                },
+                "session": {
+                  "description": "Nested PTY session id (its leader's pid) the user selected.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "pane_nested_terminal_focused",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "session"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "agent_status": {
                   "$ref": "#/schemas/event/$defs/AgentStatus"
                 },
@@ -752,6 +785,7 @@
             "pane_output_changed",
             "pane_exited",
             "pane_agent_detected",
+            "pane_nested_terminal_focused",
             "pane_agent_status_changed",
             "layout_updated"
           ],
@@ -3084,6 +3118,52 @@
           ],
           "type": "object"
         },
+        "PaneReportNestedTerminalParams": {
+          "properties": {
+            "agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "changed": {
+              "default": true,
+              "description": "False for heartbeat reports whose text did not change.",
+              "type": "boolean"
+            },
+            "closed": {
+              "default": false,
+              "type": "boolean"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "pid": {
+              "description": "Pid of any process running in the nested terminal (e.g. the embedded\nterminal's job pid); the server resolves it to its PTY session.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "text": {
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            },
+            "visible": {
+              "description": "Whether the editor currently displays this terminal.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "pane_id",
+            "pid"
+          ],
+          "type": "object"
+        },
         "PaneResizeParams": {
           "properties": {
             "amount": {
@@ -4170,6 +4250,18 @@
               "properties": {
                 "type": {
                   "const": "pane.agent_detected",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "pane.nested_terminal_focused",
                   "type": "string"
                 }
               },
@@ -5964,6 +6056,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.report_nested_terminal",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneReportNestedTerminalParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.report_metadata",
               "type": "string"
             },
@@ -7381,6 +7489,39 @@
                     "null"
                   ]
                 },
+                "pane_id": {
+                  "type": "string"
+                },
+                "session": {
+                  "description": "Nested PTY session id (its leader's pid) the user selected.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "pane_nested_terminal_focused",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "session"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "agent_status": {
                   "$ref": "#/schemas/success_response/$defs/AgentStatus"
                 },
@@ -7480,6 +7621,7 @@
             "pane_output_changed",
             "pane_exited",
             "pane_agent_detected",
+            "pane_nested_terminal_focused",
             "pane_agent_status_changed",
             "layout_updated"
           ],

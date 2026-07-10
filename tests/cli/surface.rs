@@ -426,6 +426,8 @@ fn completion_command_prints_zsh_script_without_session_startup() {
         .env_remove("HERDR_SOCKET_PATH")
         .env_remove("HERDR_CLIENT_SOCKET_PATH")
         .env_remove("HERDR_ENV")
+        .env_remove("HERDR_AGENT")
+        .env_remove("HERDR_CONFIG_PATH")
         .output()
         .unwrap();
 

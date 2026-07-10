@@ -1488,6 +1488,42 @@ impl AppState {
                 })
                 .into_iter()
                 .collect(),
+            AppEvent::NestedAgentsObserved { pane_id, agents } => {
+                let now = std::time::Instant::now();
+                self.update_terminal_nested_state(pane_id, |terminal| {
+                    terminal.reconcile_nested_agents(&agents, now)
+                });
+                Vec::new()
+            }
+            AppEvent::NestedTerminalReported {
+                pane_id,
+                session,
+                pid,
+                agent,
+                changed,
+                text,
+                title,
+                visible,
+                closed,
+            } => {
+                let now = std::time::Instant::now();
+                self.update_terminal_nested_state(pane_id, |terminal| {
+                    terminal.apply_nested_terminal_report(
+                        crate::terminal::NestedTerminalReport {
+                            session,
+                            pid,
+                            agent,
+                            changed,
+                            text: &text,
+                            title: &title,
+                            visible,
+                            closed,
+                        },
+                        now,
+                    )
+                });
+                Vec::new()
+            }
             AppEvent::HookStateReported {
                 pane_id,
                 source,
@@ -1661,6 +1697,36 @@ impl AppState {
         F: FnOnce(&mut crate::terminal::TerminalState) -> Option<TerminalStateMutation>,
     {
         self.update_terminal_state_with_completion_policy(pane_id, false, update)
+    }
+
+    fn update_terminal_nested_state<F>(&mut self, pane_id: PaneId, update: F) -> bool
+    where
+        F: FnOnce(&mut crate::terminal::TerminalState) -> crate::terminal::NestedAgentsMutation,
+    {
+        let ws_idx = self
+            .workspaces
+            .iter()
+            .position(|ws| ws.pane_state(pane_id).is_some());
+        let Some(ws_idx) = ws_idx else {
+            return false;
+        };
+        let Some(terminal_id) = self.workspaces[ws_idx]
+            .pane_state(pane_id)
+            .map(|pane| pane.attached_terminal_id.clone())
+        else {
+            return false;
+        };
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return false;
+        };
+        let mutation = update(terminal);
+        for key in &mutation.state_changed_keys {
+            self.next_agent_state_change_seq += 1;
+            if let Some(entry) = terminal.nested_agents.get_mut(key) {
+                entry.last_state_change_seq = Some(self.next_agent_state_change_seq);
+            }
+        }
+        mutation.changed
     }
 
     fn update_terminal_state_with_completion_policy<F>(

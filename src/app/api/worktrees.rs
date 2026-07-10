@@ -624,7 +624,7 @@ mod tests {
 
     #[cfg(not(windows))]
     fn test_shell() -> &'static str {
-        "/usr/bin/true"
+        super::super::test_support::exiting_test_command()
     }
 
     fn app_with_parent(repo: &Path) -> App {

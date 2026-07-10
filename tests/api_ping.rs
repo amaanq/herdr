@@ -148,6 +148,8 @@ fn spawn_herdr_with_options(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", shell);
     cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_AGENT");
+    cmd.env_remove("HERDR_CONFIG_PATH");
     if let Some(path) = path_override {
         cmd.env("PATH", path);
     }

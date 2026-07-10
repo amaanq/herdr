@@ -1,10 +1,11 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{Read, Write},
     os::fd::RawFd,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 pub(super) const REMOTE_BRIDGE_CLOCK: libc::clockid_t = libc::CLOCK_BOOTTIME;
@@ -721,6 +722,124 @@ pub fn process_agent_hint(pid: u32) -> Option<crate::detect::Agent> {
     }
     let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
     super::parse_agent_env_hint(&environ)
+}
+
+const NESTED_SESSION_ENTRIES_CACHE_TTL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcSessionEntry {
+    pid: u32,
+    ppid: u32,
+    session: i32,
+    tty_nr: i32,
+}
+
+static NESTED_SESSION_ENTRIES_CACHE: Mutex<Option<(Instant, Vec<ProcSessionEntry>)>> =
+    Mutex::new(None);
+
+/// Session leaders of nested PTY sessions running beneath `child_pid`.
+///
+/// Programs that embed terminals (e.g. Neovim's `:terminal`) run their child
+/// on a PTY they own, in a new session, so that child never joins the pane
+/// TTY's foreground group. Each such session is anchored by its leader: a
+/// descendant of the pane child that leads its own session and has a
+/// controlling terminal different from the pane's.
+pub fn nested_pty_session_leaders(child_pid: u32) -> Vec<u32> {
+    nested_pty_session_leaders_from_entries(child_pid, &cached_session_entries())
+}
+
+fn nested_pty_session_leaders_from_entries(
+    child_pid: u32,
+    entries: &[ProcSessionEntry],
+) -> Vec<u32> {
+    let Some(child) = entries.iter().find(|entry| entry.pid == child_pid) else {
+        return Vec::new();
+    };
+
+    let mut children_by_ppid: HashMap<u32, Vec<&ProcSessionEntry>> = HashMap::new();
+    for entry in entries {
+        children_by_ppid.entry(entry.ppid).or_default().push(entry);
+    }
+
+    let mut leaders = Vec::new();
+    let mut frontier = vec![child_pid];
+    while let Some(pid) = frontier.pop() {
+        let Some(children) = children_by_ppid.get(&pid) else {
+            continue;
+        };
+        for entry in children {
+            frontier.push(entry.pid);
+            if entry.session > 0
+                && entry.pid == entry.session as u32
+                && entry.tty_nr != 0
+                && entry.session != child.session
+            {
+                leaders.push(entry.pid);
+            }
+        }
+    }
+
+    // Newest-first so the most recently opened nested terminal wins when
+    // several host agents at once.
+    leaders.sort_unstable_by(|a, b| b.cmp(a));
+    leaders
+}
+
+fn cached_session_entries() -> Vec<ProcSessionEntry> {
+    let mut cache = NESTED_SESSION_ENTRIES_CACHE
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let now = Instant::now();
+    if let Some((built_at, entries)) = cache.as_ref() {
+        if now.duration_since(*built_at) < NESTED_SESSION_ENTRIES_CACHE_TTL {
+            return entries.clone();
+        }
+    }
+    let entries = build_session_entries();
+    *cache = Some((now, entries.clone()));
+    entries
+}
+
+fn build_session_entries() -> Vec<ProcSessionEntry> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let pid_str = file_name.to_str()?;
+            if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let pid = pid_str.parse::<u32>().ok()?;
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            process_session_entry_from_stat(pid, &stat)
+        })
+        .collect()
+}
+
+fn process_session_entry_from_stat(pid: u32, stat: &str) -> Option<ProcSessionEntry> {
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // After (comm): state(0) ppid(1) pgrp(2) session(3) tty_nr(4) tpgid(5)
+    Some(ProcSessionEntry {
+        pid,
+        ppid: fields.get(1)?.parse().ok()?,
+        session: fields.get(3)?.parse().ok()?,
+        tty_nr: fields.get(4)?.parse().ok()?,
+    })
+}
+
+/// Session id of the PTY session a process belongs to.
+pub fn process_pty_session_id(pid: u32) -> Option<u32> {
+    let session = process_session_id(pid)?;
+    (session > 0).then_some(session as u32)
+}
+
+/// Whether `session` is a nested PTY session under `child_pid`.
+/// `None` when the platform cannot determine process ancestry.
+pub fn nested_pty_session_belongs_to(child_pid: u32, session: u32) -> Option<bool> {
+    Some(nested_pty_session_leaders(child_pid).contains(&session))
 }
 
 pub fn session_processes(child_pid: u32) -> Vec<u32> {
@@ -1566,6 +1685,133 @@ mod tests {
         assert_eq!(discover(), vec![200]);
         children.borrow_mut().insert((100, 100), vec![200, 201]);
         assert_eq!(discover(), vec![200, 201]);
+    }
+
+    fn session_entry(pid: u32, ppid: u32, session: i32, tty_nr: i32) -> ProcSessionEntry {
+        ProcSessionEntry {
+            pid,
+            ppid,
+            session,
+            tty_nr,
+        }
+    }
+
+    #[test]
+    fn nested_pty_session_leaders_finds_editor_embedded_terminal_session() {
+        // pane shell(100) -> nvim(101) -> nested terminal shell(102, own
+        // session + tty) -> claude(103, same nested session, not a leader)
+        let entries = [
+            session_entry(100, 1, 100, 5),
+            session_entry(101, 100, 100, 5),
+            session_entry(102, 101, 102, 7),
+            session_entry(103, 102, 102, 7),
+        ];
+
+        assert_eq!(
+            nested_pty_session_leaders_from_entries(100, &entries),
+            [102]
+        );
+    }
+
+    #[test]
+    fn nested_pty_session_leaders_ignores_sessions_without_controlling_tty() {
+        let entries = [
+            session_entry(100, 1, 100, 5),
+            session_entry(101, 100, 100, 5),
+            session_entry(104, 101, 104, 0),
+        ];
+
+        assert!(nested_pty_session_leaders_from_entries(100, &entries).is_empty());
+    }
+
+    #[test]
+    fn nested_pty_session_leaders_ignores_unrelated_sessions() {
+        let entries = [session_entry(100, 1, 100, 5), session_entry(200, 1, 200, 9)];
+
+        assert!(nested_pty_session_leaders_from_entries(100, &entries).is_empty());
+    }
+
+    #[test]
+    fn nested_pty_session_leaders_orders_newest_first() {
+        let entries = [
+            session_entry(100, 1, 100, 5),
+            session_entry(101, 100, 100, 5),
+            session_entry(102, 101, 102, 7),
+            session_entry(110, 101, 110, 8),
+        ];
+
+        assert_eq!(
+            nested_pty_session_leaders_from_entries(100, &entries),
+            [110, 102]
+        );
+    }
+
+    #[test]
+    fn nested_pty_session_leaders_missing_child_returns_empty() {
+        assert!(nested_pty_session_leaders_from_entries(100, &[]).is_empty());
+    }
+
+    #[test]
+    fn process_session_entry_parses_stat_fields() {
+        let entry = process_session_entry_from_stat(
+            103,
+            "103 (some (weird) comm) S 102 103 102 34823 103 4194304 0",
+        )
+        .expect("stat should parse");
+
+        assert_eq!(entry, session_entry(103, 102, 102, 34823));
+    }
+
+    #[test]
+    fn nested_pty_session_leaders_detects_real_nested_pty() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping: python3 unavailable");
+            return;
+        }
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("failed to open pty");
+
+        // python's pty.spawn forks a new session on a fresh PTY, mimicking an
+        // editor-embedded terminal.
+        let mut cmd = CommandBuilder::new("python3");
+        cmd.arg("-c");
+        cmd.arg("import pty; pty.spawn(['sleep', '999'])");
+        let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn");
+        let pid = child.process_id().expect("no pid");
+
+        let mut leaders = Vec::new();
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            leaders = nested_pty_session_leaders_from_entries(pid, &build_session_entries());
+            if !leaders.is_empty() {
+                break;
+            }
+        }
+
+        child.kill().ok();
+        child.wait().ok();
+
+        assert!(
+            !leaders.is_empty(),
+            "expected a nested pty session leader under python3 pty.spawn"
+        );
     }
 
     #[test]

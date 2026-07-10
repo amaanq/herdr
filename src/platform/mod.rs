@@ -493,6 +493,21 @@ pub(crate) fn parse_agent_env_hint(environ: &[u8]) -> Option<crate::detect::Agen
     None
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn nested_pty_session_leaders(_child_pid: u32) -> Vec<u32> {
+    Vec::new()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_pty_session_id(_pid: u32) -> Option<u32> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn nested_pty_session_belongs_to(_child_pid: u32, _session: u32) -> Option<bool> {
+    None
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[derive(Debug)]
 pub(crate) struct InputSourceRestore;
