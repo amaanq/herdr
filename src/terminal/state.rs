@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -121,6 +121,119 @@ struct RecentAgentProcessExit {
     observed_at: Instant,
 }
 
+/// How long report activity keeps a nested agent in `Working` after its
+/// terminal text stops changing. Mirrors PTY-activity-as-working authority
+/// for pane agents, with heartbeat reports driving the decay.
+const NESTED_WORKING_DECAY: Duration = Duration::from_millis(2500);
+/// How long a manifest-derived `Working` survives without fresh text
+/// activity. Working chrome animates (spinners repaint buffer cells), so a
+/// frame that stays byte-identical this long is a stale freeze, not live
+/// work — without this bound a crash mid-turn would pin `Working` forever.
+const NESTED_MANIFEST_WORKING_DECAY: Duration = Duration::from_secs(10);
+/// Grace period during which a reported-but-unscanned nested entry survives
+/// scan reconciliation. Reports and the /proc scan race; heartbeats sustain
+/// live entries and dead ones expire once heartbeats stop.
+const NESTED_REPORT_GRACE: Duration = Duration::from_secs(5);
+
+/// An agent running on a nested PTY inside this terminal's process tree
+/// (e.g. an editor-embedded terminal). Identity and liveness come from the
+/// nested PTY scan; state comes from reported terminal text run through the
+/// screen manifests, with report activity as the working authority.
+///
+/// Deliberately separate from the pane's single agent slot and hook
+/// authority: nested entries never participate in effective-state
+/// arbitration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NestedAgentEntry {
+    pub agent: Agent,
+    pub state: AgentState,
+    pub last_state_change_seq: Option<u64>,
+    pub has_report: bool,
+    /// Whether the embedding editor currently displays this terminal.
+    /// `None` until a reporter says either way (scan-only entries).
+    pub visible: Option<bool>,
+    /// Whether the nested PTY scan has ever observed this session. Once it
+    /// has, the scan is the removal authority: reports heartbeat for the
+    /// terminal, not the agent, so they must not keep an exited agent's
+    /// entry alive.
+    scan_confirmed: bool,
+    /// Raw pid the reporter used, kept as a close alias: TermClose fires
+    /// after the process died, so the pid can no longer be resolved to its
+    /// session and arrives as-is.
+    report_pid: Option<u32>,
+    last_report_at: Option<Instant>,
+    last_text_change_at: Option<Instant>,
+    last_text_fingerprint: Option<u64>,
+    last_detection_state: AgentState,
+    last_detection_visible_idle: bool,
+}
+
+impl NestedAgentEntry {
+    fn new(agent: Agent) -> Self {
+        Self {
+            agent,
+            state: AgentState::Unknown,
+            last_state_change_seq: None,
+            has_report: false,
+            visible: None,
+            scan_confirmed: false,
+            report_pid: None,
+            last_report_at: None,
+            last_text_change_at: None,
+            last_text_fingerprint: None,
+            last_detection_state: AgentState::Unknown,
+            last_detection_visible_idle: false,
+        }
+    }
+
+    fn activity_within(&self, window: Duration, now: Instant) -> bool {
+        self.last_text_change_at
+            .is_some_and(|at| now.saturating_duration_since(at) <= window)
+    }
+
+    fn resolve_state(&self, now: Instant) -> AgentState {
+        match self.last_detection_state {
+            AgentState::Blocked => AgentState::Blocked,
+            AgentState::Working if self.activity_within(NESTED_MANIFEST_WORKING_DECAY, now) => {
+                AgentState::Working
+            }
+            AgentState::Working => AgentState::Idle,
+            // Live idle chrome on screen (prompt box, idle title) outranks
+            // text activity: user keystrokes and animated idle UI repaint the
+            // buffer without meaning the agent works. Real work is caught by
+            // the manifests' working rules (spinner titles, working text).
+            AgentState::Idle if self.last_detection_visible_idle => AgentState::Idle,
+            _ if self.activity_within(NESTED_WORKING_DECAY, now) => AgentState::Working,
+            other => other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NestedAgentsMutation {
+    pub changed: bool,
+    pub state_changed_keys: Vec<u32>,
+}
+
+/// One terminal-text report for a nested agent session.
+pub struct NestedTerminalReport<'a> {
+    /// Session id of the nested PTY (its session leader's pid). Falls back
+    /// to the raw reported pid when the process is already gone.
+    pub session: u32,
+    /// The raw pid the reporter supplied, before session resolution.
+    pub pid: u32,
+    /// Agent identity resolved by the caller; required only to create a new
+    /// entry.
+    pub agent: Option<Agent>,
+    /// False for heartbeat reports whose text did not change.
+    pub changed: bool,
+    pub text: &'a str,
+    pub title: &'a str,
+    /// Whether the editor currently displays this terminal.
+    pub visible: Option<bool>,
+    pub closed: bool,
+}
+
 /// Pure state for a server-owned terminal.
 ///
 /// During the migration this is still one-to-one with a pane-backed PTY, but
@@ -162,6 +275,7 @@ pub struct TerminalState {
     agent_process_acquisition_pending: bool,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
     pub restore_error: Option<String>,
+    pub nested_agents: BTreeMap<u32, NestedAgentEntry>,
 }
 
 impl TerminalState {
@@ -202,7 +316,154 @@ impl TerminalState {
             agent_process_acquisition_pending: false,
             pending_agent_resume_plan: None,
             restore_error: None,
+            nested_agents: BTreeMap::new(),
         }
+    }
+
+    /// Whether a nested entry already tracks this session (by key or by the
+    /// raw pid it last reported with).
+    pub fn tracks_nested_session(&self, session_or_pid: u32) -> bool {
+        self.nested_agents.contains_key(&session_or_pid)
+            || self
+                .nested_agents
+                .values()
+                .any(|entry| entry.report_pid == Some(session_or_pid))
+    }
+
+    /// Reconcile nested-agent entries against a fresh nested PTY scan.
+    /// Observed sessions are inserted or re-identified; unobserved entries
+    /// expire unless a recent report is still sustaining them. Retained
+    /// entries also re-resolve their state so time-based decay (working
+    /// activity, report grace) advances even when no reports arrive — the
+    /// scan re-emits on a fixed cadence to drive this.
+    pub fn reconcile_nested_agents(
+        &mut self,
+        observed: &[(u32, Agent)],
+        now: Instant,
+    ) -> NestedAgentsMutation {
+        let mut mutation = NestedAgentsMutation::default();
+
+        for (session, agent) in observed {
+            match self.nested_agents.get_mut(session) {
+                Some(entry) if entry.agent == *agent => {
+                    entry.scan_confirmed = true;
+                }
+                Some(entry) => {
+                    *entry = NestedAgentEntry::new(*agent);
+                    entry.scan_confirmed = true;
+                    mutation.changed = true;
+                    mutation.state_changed_keys.push(*session);
+                }
+                None => {
+                    let mut entry = NestedAgentEntry::new(*agent);
+                    entry.scan_confirmed = true;
+                    self.nested_agents.insert(*session, entry);
+                    mutation.changed = true;
+                    mutation.state_changed_keys.push(*session);
+                }
+            }
+        }
+
+        let observed_keys: Vec<u32> = observed.iter().map(|(session, _)| *session).collect();
+        let before = self.nested_agents.len();
+        self.nested_agents.retain(|session, entry| {
+            observed_keys.contains(session)
+                || (!entry.scan_confirmed
+                    && entry.has_report
+                    && entry
+                        .last_report_at
+                        .is_some_and(|at| now.saturating_duration_since(at) <= NESTED_REPORT_GRACE))
+        });
+        if self.nested_agents.len() != before {
+            mutation.changed = true;
+        }
+
+        for (session, entry) in &mut self.nested_agents {
+            let state = entry.resolve_state(now);
+            if state != entry.state {
+                entry.state = state;
+                mutation.changed = true;
+                if !mutation.state_changed_keys.contains(session) {
+                    mutation.state_changed_keys.push(*session);
+                }
+            }
+        }
+
+        mutation
+    }
+
+    /// Apply a reported terminal-text snapshot for one nested agent session.
+    pub fn apply_nested_terminal_report(
+        &mut self,
+        report: NestedTerminalReport<'_>,
+        now: Instant,
+    ) -> NestedAgentsMutation {
+        let mut mutation = NestedAgentsMutation::default();
+
+        if report.closed {
+            let key = self.nested_agents.iter().find_map(|(key, entry)| {
+                (*key == report.session || entry.report_pid == Some(report.session)).then_some(*key)
+            });
+            if let Some(key) = key {
+                self.nested_agents.remove(&key);
+                mutation.changed = true;
+            }
+            return mutation;
+        }
+
+        let entry = match self.nested_agents.get_mut(&report.session) {
+            Some(entry) => entry,
+            None => {
+                let Some(agent) = report.agent else {
+                    return mutation;
+                };
+                mutation.changed = true;
+                self.nested_agents
+                    .entry(report.session)
+                    .or_insert_with(|| NestedAgentEntry::new(agent))
+            }
+        };
+
+        entry.has_report = true;
+        entry.report_pid = Some(report.pid);
+        entry.last_report_at = Some(now);
+        if report.visible.is_some() && entry.visible != report.visible {
+            entry.visible = report.visible;
+            mutation.changed = true;
+        }
+
+        if report.changed && !report.text.is_empty() {
+            let detection = crate::detect::detect_agent_with_osc(
+                Some(entry.agent),
+                report.text,
+                report.title,
+                "",
+            );
+            let fingerprint = nested_text_fingerprint(report.text, report.title);
+            if entry.last_text_fingerprint != Some(fingerprint) {
+                entry.last_text_fingerprint = Some(fingerprint);
+                // Agent-owned viewer screens (skip_state_update) change from
+                // user scrolling, not agent output; don't count that as
+                // working activity.
+                if !detection.skip_state_update {
+                    entry.last_text_change_at = Some(now);
+                }
+            }
+            if !detection.skip_state_update {
+                entry.last_detection_state = detection.state;
+                entry.last_detection_visible_idle =
+                    detection.visible_idle && detection.state == AgentState::Idle;
+            }
+        }
+
+        let state = entry.resolve_state(now);
+        if state != entry.state {
+            entry.state = state;
+            mutation.changed = true;
+            mutation.state_changed_keys.push(report.session);
+        }
+
+        mutation
     }
 
     pub fn set_detected_agent_process_at(
@@ -2466,6 +2727,14 @@ impl TerminalState {
 
 pub(crate) fn stabilize_agent_detection(detection: crate::detect::AgentDetection) -> AgentState {
     detection.state
+}
+
+fn nested_text_fingerprint(text: &str, title: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    title.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -6435,5 +6704,302 @@ mod tests {
             terminal.hook_authority.as_ref().unwrap().source,
             "custom:pi"
         );
+    }
+
+    fn nested_report(
+        session: u32,
+        agent: Option<Agent>,
+        changed: bool,
+        text: &'static str,
+    ) -> NestedTerminalReport<'static> {
+        NestedTerminalReport {
+            session,
+            pid: session,
+            agent,
+            changed,
+            text,
+            title: "",
+            visible: None,
+            closed: false,
+        }
+    }
+
+    #[test]
+    fn nested_reconcile_inserts_reidentifies_and_expires_scan_entries() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+
+        let mutation =
+            terminal.reconcile_nested_agents(&[(300, Agent::Claude), (400, Agent::Codex)], now);
+        assert!(mutation.changed);
+        assert_eq!(mutation.state_changed_keys, vec![300, 400]);
+        assert_eq!(terminal.nested_agents.len(), 2);
+        assert_eq!(terminal.nested_agents[&300].agent, Agent::Claude);
+        assert_eq!(terminal.nested_agents[&300].state, AgentState::Unknown);
+
+        let mutation =
+            terminal.reconcile_nested_agents(&[(300, Agent::Claude), (400, Agent::Codex)], now);
+        assert!(!mutation.changed);
+
+        let mutation = terminal.reconcile_nested_agents(&[(300, Agent::Gemini)], now);
+        assert!(mutation.changed);
+        assert_eq!(mutation.state_changed_keys, vec![300]);
+        assert_eq!(terminal.nested_agents.len(), 1);
+        assert_eq!(terminal.nested_agents[&300].agent, Agent::Gemini);
+    }
+
+    #[test]
+    fn nested_reconcile_re_resolves_retained_entry_states() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+
+        terminal
+            .apply_nested_terminal_report(nested_report(300, Some(Agent::Claude), true, "x"), now);
+        assert_eq!(terminal.nested_agents[&300].state, AgentState::Working);
+
+        // Reports stopped; the periodic scan re-emit must still advance
+        // time-based decay.
+        let mutation = terminal.reconcile_nested_agents(
+            &[(300, Agent::Claude)],
+            now + std::time::Duration::from_secs(3),
+        );
+        assert!(mutation.changed);
+        assert_eq!(mutation.state_changed_keys, vec![300]);
+        assert_eq!(terminal.nested_agents[&300].state, AgentState::Idle);
+    }
+
+    #[test]
+    fn nested_manifest_working_decays_without_fresh_activity() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+
+        terminal.apply_nested_terminal_report(
+            nested_report(300, Some(Agent::Pi), true, "Working..."),
+            now,
+        );
+        assert_eq!(terminal.nested_agents[&300].state, AgentState::Working);
+
+        let mutation = terminal.apply_nested_terminal_report(
+            nested_report(300, None, false, ""),
+            now + std::time::Duration::from_secs(3),
+        );
+        assert!(!mutation.changed);
+        assert_eq!(terminal.nested_agents[&300].state, AgentState::Working);
+
+        let mutation = terminal.apply_nested_terminal_report(
+            nested_report(300, None, false, ""),
+            now + std::time::Duration::from_secs(11),
+        );
+        assert!(mutation.changed);
+        assert_eq!(terminal.nested_agents[&300].state, AgentState::Idle);
+    }
+
+    #[test]
+    fn nested_reconcile_keeps_recently_reported_entries() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+
+        let mutation = terminal.apply_nested_terminal_report(
+            nested_report(300, Some(Agent::Claude), true, "output"),
+            now,
+        );
+        assert!(mutation.changed);
+
+        let mutation =
+            terminal.reconcile_nested_agents(&[], now + std::time::Duration::from_secs(1));
+        assert!(!mutation.changed);
+        assert!(terminal.nested_agents.contains_key(&300));
+
+        let mutation =
+            terminal.reconcile_nested_agents(&[], now + std::time::Duration::from_secs(6));
+        assert!(mutation.changed);
+        assert!(terminal.nested_agents.is_empty());
+    }
+
+    #[test]
+    fn nested_report_marks_activity_working_and_decays_on_heartbeat() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+
+        let mutation = terminal.apply_nested_terminal_report(
+            nested_report(300, Some(Agent::Claude), true, "plain output"),
+            now,
+        );
+        assert!(mutation.changed);
+        assert_eq!(mutation.state_changed_keys, vec![300]);
+        assert_eq!(terminal.nested_agents[&300].state, AgentState::Working);
+        assert!(terminal.nested_agents[&300].has_report);
+
+        // No-match detection for a known agent defaults to Idle, so decayed
+        // activity settles there.
+        let mutation = terminal.apply_nested_terminal_report(
+            nested_report(300, None, false, ""),
+            now + std::time::Duration::from_secs(3),
+        );
+        assert!(mutation.changed);
+        assert_eq!(terminal.nested_agents[&300].state, AgentState::Idle);
+    }
+
+    #[test]
+    fn nested_report_closed_removes_entry() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        terminal.reconcile_nested_agents(&[(300, Agent::Claude)], now);
+
+        let mutation = terminal.apply_nested_terminal_report(
+            NestedTerminalReport {
+                session: 300,
+                pid: 300,
+                agent: None,
+                changed: false,
+                text: "",
+                title: "",
+                visible: None,
+                closed: true,
+            },
+            now,
+        );
+
+        assert!(mutation.changed);
+        assert!(terminal.nested_agents.is_empty());
+    }
+
+    #[test]
+    fn nested_report_closed_matches_remembered_report_pid() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        terminal.apply_nested_terminal_report(
+            NestedTerminalReport {
+                session: 300,
+                pid: 350,
+                agent: Some(Agent::Claude),
+                changed: true,
+                text: "output",
+                title: "",
+                visible: None,
+                closed: false,
+            },
+            now,
+        );
+
+        // Process 350 is gone by TermClose, so the close arrives keyed by
+        // the raw pid instead of its resolved session.
+        let mutation = terminal.apply_nested_terminal_report(
+            NestedTerminalReport {
+                session: 350,
+                pid: 350,
+                agent: None,
+                changed: false,
+                text: "",
+                title: "",
+                visible: None,
+                closed: true,
+            },
+            now,
+        );
+
+        assert!(mutation.changed);
+        assert!(terminal.nested_agents.is_empty());
+    }
+
+    #[test]
+    fn tracks_nested_session_matches_key_and_report_pid() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        terminal.apply_nested_terminal_report(
+            NestedTerminalReport {
+                session: 300,
+                pid: 350,
+                agent: Some(Agent::Claude),
+                changed: true,
+                text: "output",
+                title: "",
+                visible: None,
+                closed: false,
+            },
+            now,
+        );
+
+        assert!(terminal.tracks_nested_session(300));
+        assert!(terminal.tracks_nested_session(350));
+        assert!(!terminal.tracks_nested_session(400));
+    }
+
+    #[test]
+    fn nested_report_visible_flag_updates_on_heartbeat() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+
+        let mut visible_report = nested_report(300, Some(Agent::Claude), true, "output");
+        visible_report.visible = Some(true);
+        terminal.apply_nested_terminal_report(visible_report, now);
+        assert_eq!(terminal.nested_agents[&300].visible, Some(true));
+
+        let mut heartbeat = nested_report(300, None, false, "");
+        heartbeat.visible = Some(false);
+        let mutation = terminal
+            .apply_nested_terminal_report(heartbeat, now + std::time::Duration::from_secs(1));
+        assert!(mutation.changed);
+        assert_eq!(terminal.nested_agents[&300].visible, Some(false));
+    }
+
+    #[test]
+    fn nested_scan_removes_exited_agent_despite_fresh_terminal_heartbeats() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+
+        terminal.reconcile_nested_agents(&[(300, Agent::Claude)], now);
+        terminal.apply_nested_terminal_report(
+            nested_report(300, None, true, "output"),
+            now + std::time::Duration::from_secs(1),
+        );
+
+        // The agent exited but the terminal lives on: heartbeats stay fresh,
+        // yet the scan no longer sees the session and must win.
+        let mutation =
+            terminal.reconcile_nested_agents(&[], now + std::time::Duration::from_secs(2));
+
+        assert!(mutation.changed);
+        assert!(terminal.nested_agents.is_empty());
+    }
+
+    #[test]
+    fn nested_visible_idle_chrome_outranks_text_activity() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+
+        // A non-spinner OSC title matches codex's visible_idle rule; the
+        // changing text simulates the user typing in the prompt.
+        let report = |text: &'static str| NestedTerminalReport {
+            session: 300,
+            pid: 300,
+            agent: Some(Agent::Codex),
+            changed: true,
+            text,
+            title: "codex",
+            visible: Some(true),
+            closed: false,
+        };
+
+        terminal.apply_nested_terminal_report(report("hello"), now);
+        assert_eq!(terminal.nested_agents[&300].state, AgentState::Idle);
+
+        terminal.apply_nested_terminal_report(
+            report("hello w"),
+            now + std::time::Duration::from_millis(500),
+        );
+        assert_eq!(terminal.nested_agents[&300].state, AgentState::Idle);
+    }
+
+    #[test]
+    fn nested_report_without_identity_is_ignored() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+
+        let mutation =
+            terminal.apply_nested_terminal_report(nested_report(300, None, true, "output"), now);
+
+        assert!(!mutation.changed);
+        assert!(terminal.nested_agents.is_empty());
     }
 }

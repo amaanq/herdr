@@ -1158,6 +1158,9 @@ impl App {
             Method::PaneReportAgentSession(params) => {
                 return self.handle_pane_report_agent_session(request.id, params);
             }
+            Method::PaneReportNestedTerminal(params) => {
+                return self.handle_pane_report_nested_terminal(request.id, params);
+            }
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);
             }
@@ -1354,8 +1357,30 @@ pub(super) mod test_support {
         }
         #[cfg(not(windows))]
         {
-            "/usr/bin/true"
+            resolve_test_binary("true", "/usr/bin/true")
         }
+    }
+
+    /// Distros without an FHS layout (NixOS) lack /usr/bin and /bin beyond
+    /// /bin/sh, so hardcoded binary paths must be resolved from PATH.
+    #[cfg(not(windows))]
+    pub(crate) fn resolve_test_binary(name: &'static str, fallback: &'static str) -> &'static str {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+
+        static RESOLVED: OnceLock<Mutex<HashMap<&'static str, &'static str>>> = OnceLock::new();
+        let resolved = RESOLVED.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut resolved = resolved.lock().unwrap_or_else(|err| err.into_inner());
+        resolved.entry(name).or_insert_with(|| {
+            std::env::var_os("PATH")
+                .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|dir| dir.join(name))
+                .find(|candidate| candidate.is_file())
+                .map(|path| &*path.display().to_string().leak())
+                .unwrap_or(fallback)
+        })
     }
 
     pub(crate) fn shutdown_test_runtimes(app: &mut crate::app::App) {

@@ -10,11 +10,11 @@ use crate::api::schema::{
     PaneNeighborParams, PaneNeighborResult, PaneProcessInfo, PaneProcessInfoParams,
     PaneProcessInfoProcess, PaneReadParams, PaneReadResult, PaneReleaseAgentParams,
     PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
-    PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
-    PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams, PaneSendKeysParams,
-    PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason, PaneSwapResult,
-    PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ResponseResult,
+    PaneReportMetadataParams, PaneReportNestedTerminalParams, PaneResizeParams, PaneResizeReason,
+    PaneResizeResult, PaneScrollParams, PaneSelectionReadParams, PaneSendInputParams,
+    PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneSwapReason,
+    PaneSwapResult, PaneTarget, PaneTextPoint, PaneTextRange, PaneZoomMode, PaneZoomParams,
+    PaneZoomReason, PaneZoomResult, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::App;
@@ -1688,6 +1688,85 @@ impl App {
             seq,
             argv,
         });
+        encode_success(id, ResponseResult::Ok {})
+    }
+
+    pub(super) fn handle_pane_report_nested_terminal(
+        &mut self,
+        id: String,
+        params: PaneReportNestedTerminalParams,
+    ) -> String {
+        const MAX_NESTED_REPORT_TEXT: usize = 16 * 1024;
+
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        if params.pid == 0 {
+            return encode_error(id, "invalid_pid", "pid must be non-zero".to_string());
+        }
+        let session = crate::platform::process_pty_session_id(params.pid).unwrap_or(params.pid);
+
+        let entry_known = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone())
+            .and_then(|terminal_id| self.state.terminals.get(&terminal_id))
+            .is_some_and(|terminal| terminal.tracks_nested_session(session));
+        // A stale HERDR_PANE_ID (or buggy reporter) must not create rows on
+        // an unrelated pane, new sessions must prove ancestry under this
+        // pane's process tree where the platform can check it. Closes are
+        // exempt because the reported process is already dead and removal is
+        // scoped to entries this pane tracks.
+        if !params.closed && !entry_known {
+            let shell_pid = self
+                .lookup_runtime(ws_idx, pane_id)
+                .and_then(|(runtime, _)| runtime.child_pid());
+            let belongs = shell_pid
+                .and_then(|shell| crate::platform::nested_pty_session_belongs_to(shell, session));
+            if belongs == Some(false) {
+                return encode_error(
+                    id,
+                    "invalid_nested_session",
+                    "pid is not a nested pty session of this pane".to_string(),
+                );
+            }
+        }
+
+        let agent = params
+            .agent
+            .as_deref()
+            .and_then(crate::detect::parse_agent_label)
+            .or_else(|| {
+                let job = crate::detect::foreground_job(session)?;
+                job.processes
+                    .iter()
+                    .find_map(|process| crate::platform::process_agent_hint(process.pid))
+                    .or_else(|| crate::detect::identify_agent_in_job(&job).map(|(agent, _)| agent))
+            });
+
+        let mut text = params.text;
+        if text.len() > MAX_NESTED_REPORT_TEXT {
+            let cut = text.len() - MAX_NESTED_REPORT_TEXT;
+            let boundary = (cut..text.len())
+                .find(|index| text.is_char_boundary(*index))
+                .unwrap_or(text.len());
+            text = text.split_off(boundary);
+        }
+
+        self.handle_internal_event(crate::events::AppEvent::NestedTerminalReported {
+            pane_id,
+            session,
+            pid: params.pid,
+            agent,
+            changed: params.changed,
+            text,
+            title: params.title,
+            visible: params.visible,
+            closed: params.closed,
+        });
+
         encode_success(id, ResponseResult::Ok {})
     }
 

@@ -17,6 +17,60 @@ pub struct PaneDetail {
     pub tokens: HashMap<String, String>,
 }
 
+fn nested_display_state(
+    terminal: &TerminalState,
+    entry: &crate::terminal::state::NestedAgentEntry,
+) -> AgentState {
+    if !entry.has_report && terminal.effective_known_agent() == Some(entry.agent) {
+        terminal.state
+    } else {
+        entry.state
+    }
+}
+
+fn pane_slot_is_distinct_from_nested(terminal: &TerminalState) -> bool {
+    terminal.effective_known_agent().is_some_and(|agent| {
+        !terminal
+            .nested_agents
+            .values()
+            .any(|entry| entry.agent == agent)
+    })
+}
+
+fn terminal_row_states(terminal: &TerminalState) -> Vec<AgentState> {
+    if terminal.nested_agents.is_empty() {
+        return vec![terminal.state];
+    }
+
+    let mut states = terminal
+        .nested_agents
+        .values()
+        .map(|entry| nested_display_state(terminal, entry))
+        .collect::<Vec<_>>();
+    if pane_slot_is_distinct_from_nested(terminal) {
+        states.push(terminal.state);
+    }
+    states
+}
+
+impl TerminalState {
+    /// Folds nested agents into one state for surfaces that show a single row per pane.
+    pub fn pane_display_state(&self, seen: bool) -> AgentState {
+        terminal_row_states(self)
+            .into_iter()
+            .max_by_key(|state| pane_attention_priority(*state, seen))
+            .unwrap_or(self.state)
+    }
+
+    pub fn pane_display_state_change_seq(&self) -> Option<u64> {
+        self.nested_agents
+            .values()
+            .filter_map(|entry| entry.last_state_change_seq)
+            .chain(self.last_agent_state_change_seq)
+            .max()
+    }
+}
+
 impl Tab {
     fn pane_details(
         &self,
@@ -26,22 +80,41 @@ impl Tab {
         self.layout
             .pane_ids()
             .iter()
-            .filter_map(|id| {
-                let pane = self.panes.get(id)?;
-                let terminal = terminals.get(&pane.attached_terminal_id)?;
+            .flat_map(|id| {
+                let Some(pane) = self.panes.get(id) else {
+                    return Vec::new();
+                };
+                let Some(terminal) = terminals.get(&pane.attached_terminal_id) else {
+                    return Vec::new();
+                };
+
+                let mut details = Vec::new();
                 let agent_kind_label = terminal.effective_agent_label().map(str::to_string);
-                if terminal.agent_name.is_none() && agent_kind_label.is_none() {
-                    return None;
+                if (terminal.nested_agents.is_empty()
+                    || pane_slot_is_distinct_from_nested(terminal))
+                    && (terminal.agent_name.is_some() || agent_kind_label.is_some())
+                {
+                    details.push(PaneDetail {
+                        pane_id: *id,
+                        tab_idx,
+                        agent_kind_label,
+                        state: terminal.state,
+                        seen: pane.seen,
+                        last_agent_state_change_seq: terminal.last_agent_state_change_seq,
+                        tokens: terminal.metadata_tokens.values(),
+                    });
                 }
-                Some(PaneDetail {
+
+                details.extend(terminal.nested_agents.values().map(|entry| PaneDetail {
                     pane_id: *id,
                     tab_idx,
-                    agent_kind_label,
-                    state: terminal.state,
+                    agent_kind_label: Some(crate::detect::agent_label(entry.agent).to_string()),
+                    state: nested_display_state(terminal, entry),
                     seen: pane.seen,
-                    last_agent_state_change_seq: terminal.last_agent_state_change_seq,
-                    tokens: terminal.metadata_tokens.values(),
-                })
+                    last_agent_state_change_seq: entry.last_state_change_seq,
+                    tokens: HashMap::new(),
+                }));
+                details
             })
             .collect()
     }
@@ -65,10 +138,13 @@ impl Workspace {
         self.tabs
             .iter()
             .flat_map(|tab| tab.panes.values())
-            .filter_map(|pane| {
+            .flat_map(|pane| {
                 terminals
                     .get(&pane.attached_terminal_id)
-                    .map(|terminal| (terminal.state, pane.seen))
+                    .map(terminal_row_states)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(move |state| (state, pane.seen))
             })
             .max_by_key(|(state, seen)| pane_attention_priority(*state, *seen))
             .unwrap_or((AgentState::Unknown, true))
@@ -154,6 +230,105 @@ mod tests {
 
         assert_eq!(state, AgentState::Idle);
         assert!(!seen);
+    }
+
+    #[test]
+    fn nested_rows_suppress_duplicate_pane_slot_row() {
+        let ws = Workspace::test_new("test");
+        let root_pane = ws.tabs[0].root_pane;
+        let mut terminals = HashMap::new();
+        let mut terminal = terminal_for_pane(&ws, root_pane);
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Working);
+        terminal.reconcile_nested_agents(
+            &[(300, Agent::Claude), (400, Agent::Gemini)],
+            std::time::Instant::now(),
+        );
+        terminals.insert(terminal.id.clone(), terminal);
+
+        let details: Vec<_> = ws
+            .pane_details(&terminals)
+            .into_iter()
+            .map(|detail| (detail.agent_kind_label, detail.state))
+            .collect();
+
+        assert_eq!(
+            details,
+            vec![
+                (Some("claude".into()), AgentState::Working),
+                (Some("gemini".into()), AgentState::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_pane_slot_agent_keeps_its_row_alongside_nested_rows() {
+        let ws = Workspace::test_new("test");
+        let root_pane = ws.tabs[0].root_pane;
+        let mut terminals = HashMap::new();
+        let mut terminal = terminal_for_pane(&ws, root_pane);
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Working);
+        terminal.reconcile_nested_agents(&[(300, Agent::Claude)], std::time::Instant::now());
+        terminals.insert(terminal.id.clone(), terminal);
+
+        let details: Vec<_> = ws
+            .pane_details(&terminals)
+            .into_iter()
+            .map(|detail| (detail.agent_kind_label, detail.state))
+            .collect();
+
+        assert_eq!(
+            details,
+            vec![
+                (Some("codex".into()), AgentState::Working),
+                (Some("claude".into()), AgentState::Unknown),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_only_nested_entry_matching_pane_agent_borrows_pane_state() {
+        let ws = Workspace::test_new("test");
+        let root_pane = ws.tabs[0].root_pane;
+        let mut terminals = HashMap::new();
+        let mut terminal = terminal_for_pane(&ws, root_pane);
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Working);
+        terminal.reconcile_nested_agents(&[(300, Agent::Codex)], std::time::Instant::now());
+        terminals.insert(terminal.id.clone(), terminal);
+
+        let details: Vec<_> = ws
+            .pane_details(&terminals)
+            .into_iter()
+            .map(|detail| (detail.agent_kind_label, detail.state))
+            .collect();
+
+        assert_eq!(details, vec![(Some("codex".into()), AgentState::Working)]);
+    }
+
+    #[test]
+    fn aggregate_state_folds_nested_agent_states() {
+        let ws = Workspace::test_new("test");
+        let root_pane = ws.tabs[0].root_pane;
+        let mut terminals = HashMap::new();
+        let mut terminal = terminal_for_pane(&ws, root_pane);
+        let now = std::time::Instant::now();
+        terminal.apply_nested_terminal_report(
+            crate::terminal::NestedTerminalReport {
+                session: 300,
+                pid: 300,
+                agent: Some(Agent::Claude),
+                changed: true,
+                text: "plain output",
+                title: "",
+                visible: None,
+                closed: false,
+            },
+            now,
+        );
+        terminals.insert(terminal.id.clone(), terminal);
+
+        let (state, _) = ws.aggregate_state(&terminals);
+
+        assert_eq!(state, AgentState::Working);
     }
 
     #[test]

@@ -269,6 +269,13 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .args(["workspace", "list"])
         .env("HERDR_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("COPILOT_HOME")
+        .env_remove("QODER_CONFIG_DIR")
+        .env_remove("CURSOR_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(workspace_list.status.code(), Some(1));
@@ -277,6 +284,13 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .args(["integration", "install", "pi"])
         .env("HERDR_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("COPILOT_HOME")
+        .env_remove("QODER_CONFIG_DIR")
+        .env_remove("CURSOR_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(integration_install.status.code(), Some(0));
@@ -289,6 +303,13 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .args(["integration", "status"])
         .env("HERDR_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("COPILOT_HOME")
+        .env_remove("QODER_CONFIG_DIR")
+        .env_remove("CURSOR_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(integration_status.status.code(), Some(0));
@@ -300,6 +321,13 @@ fn integration_commands_run_locally_when_server_is_missing() {
         .args(["integration", "uninstall", "pi"])
         .env("HERDR_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("COPILOT_HOME")
+        .env_remove("QODER_CONFIG_DIR")
+        .env_remove("CURSOR_CONFIG_DIR")
         .output()
         .unwrap();
     assert_eq!(integration_uninstall.status.code(), Some(0));
@@ -332,6 +360,13 @@ fn integration_status_outdated_only_prints_action_for_legacy_install() {
         .args(["integration", "status", "--outdated-only"])
         .env("HERDR_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("COPILOT_HOME")
+        .env_remove("QODER_CONFIG_DIR")
+        .env_remove("CURSOR_CONFIG_DIR")
         .output()
         .unwrap();
 
@@ -358,6 +393,13 @@ fn integration_status_rejects_unknown_flags() {
         .args(["integration", "status", "--wat"])
         .env("HERDR_SOCKET_PATH", &missing_socket)
         .env("HOME", &home_dir)
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("KIMI_CODE_HOME")
+        .env_remove("COPILOT_HOME")
+        .env_remove("QODER_CONFIG_DIR")
+        .env_remove("CURSOR_CONFIG_DIR")
         .output()
         .unwrap();
 

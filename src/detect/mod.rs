@@ -1903,7 +1903,11 @@ mod tests {
 
         let mut cmd = CommandBuilder::new("bash");
         cmd.arg("-c");
-        cmd.arg("bash -c 'exec -a codex sleep 999' & wait");
+        // `exec -a` onto a coreutils applet dies under single-binary
+        // multi-call coreutils (argv[0] selects the applet), so bash itself
+        // carries the codex argv0; the trailing `:` keeps it from
+        // tail-exec'ing sleep and handing the argv0 back to coreutils.
+        cmd.arg(r#"bash -c 'exec -a codex bash -c "sleep 999; :"' & wait"#);
         let mut child = pair.slave.spawn_command(cmd).expect("failed to spawn");
         let pid = child.process_id().expect("no pid");
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1917,9 +1921,9 @@ mod tests {
 
         let job = job.expect("expected foreground job");
         assert!(
-            job.processes.iter().any(|process| process.name == "bash")
+            job.processes.iter().any(|process| process.name == "sleep")
                 && job.processes.iter().any(|process| {
-                    process.name == "sleep"
+                    process.name == "bash"
                         && process
                             .argv
                             .as_deref()

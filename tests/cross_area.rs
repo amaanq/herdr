@@ -126,6 +126,8 @@ fn spawn_server_with_path(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_AGENT");
+    cmd.env_remove("HERDR_CONFIG_PATH");
     if let Some(path) = path_override {
         cmd.env("PATH", path);
     }
@@ -165,6 +167,8 @@ fn spawn_client_process(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_AGENT");
+    cmd.env_remove("HERDR_CONFIG_PATH");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());

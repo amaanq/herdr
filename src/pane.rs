@@ -723,11 +723,24 @@ fn hinted_process_probe_result(
     ))
 }
 
+fn nested_pty_agent_in_jobs(
+    jobs: &[crate::platform::ForegroundJob],
+    read_hint: impl Fn(u32) -> Option<Agent> + Copy,
+) -> Option<(Agent, String)> {
+    jobs.iter().find_map(|job| {
+        if let Some(agent) = agent_hint_for_foreground_job_members(job, read_hint) {
+            return Some((agent, crate::detect::agent_label(agent).to_string()));
+        }
+        crate::detect::identify_agent_in_job(job)
+    })
+}
+
 fn probe_foreground_process_from_jobs(
     pid: u32,
     foreground_pgid: Option<u32>,
     leader_job: Option<crate::platform::ForegroundJob>,
     foreground_job: impl FnOnce() -> Option<crate::platform::ForegroundJob>,
+    nested_pty_jobs: impl FnOnce() -> Vec<crate::platform::ForegroundJob>,
     read_hint: impl Fn(u32) -> Option<Agent> + Copy,
 ) -> ProcessProbeResult {
     if let Some(job) = leader_job.as_ref() {
@@ -761,12 +774,26 @@ fn probe_foreground_process_from_jobs(
             );
         }
 
-        let identified = crate::detect::identify_agent_in_job(job);
+        if let Some((agent, process_name)) = crate::detect::identify_agent_in_job(job) {
+            return process_probe_result(job, pid, agent, process_name);
+        }
+        // The pane TTY's foreground job is not an agent; an agent may still be
+        // running on a nested PTY (e.g. inside an editor's embedded terminal).
+        let nested = nested_pty_agent_in_jobs(&nested_pty_jobs(), read_hint);
         return ProcessProbeResult {
             process_group_id: Some(job.process_group_id),
             foreground_is_pane_shell: job.processes.iter().any(|process| process.pid == pid),
-            agent: identified.as_ref().map(|(agent, _)| *agent),
-            process_name: identified.map(|(_, process_name)| process_name),
+            agent: nested.as_ref().map(|(agent, _)| *agent),
+            process_name: nested.map(|(_, process_name)| process_name),
+        };
+    }
+
+    if let Some((agent, process_name)) = nested_pty_agent_in_jobs(&nested_pty_jobs(), read_hint) {
+        return ProcessProbeResult {
+            process_group_id: foreground_pgid,
+            foreground_is_pane_shell: false,
+            agent: Some(agent),
+            process_name: Some(process_name),
         };
     }
 
@@ -784,8 +811,88 @@ fn probe_foreground_process(pid: u32, foreground_pgid: Option<u32>) -> ProcessPr
         foreground_pgid,
         foreground_pgid.and_then(crate::detect::foreground_group_leader_job),
         || crate::detect::foreground_job(pid),
+        || nested_pty_foreground_jobs(pid),
         crate::platform::process_agent_hint,
     )
+}
+
+fn nested_pty_foreground_jobs(pid: u32) -> Vec<crate::platform::ForegroundJob> {
+    crate::platform::nested_pty_session_leaders(pid)
+        .into_iter()
+        .filter_map(crate::detect::foreground_job)
+        .collect()
+}
+
+/// Identify every agent running on a nested PTY under `pid`, keyed by the
+/// nested session id (its leader's pid). Unlike the single-slot probe
+/// fallback, this reports all of them so pane state can track each one.
+fn nested_pty_agent_observations(pid: u32) -> Vec<(u32, Agent)> {
+    crate::platform::nested_pty_session_leaders(pid)
+        .into_iter()
+        .filter_map(|leader| {
+            let job = crate::detect::foreground_job(leader)?;
+            let agent =
+                agent_hint_for_foreground_job_members(&job, crate::platform::process_agent_hint)
+                    .or_else(|| {
+                        crate::detect::identify_agent_in_job(&job).map(|(agent, _)| agent)
+                    })?;
+            Some((leader, agent))
+        })
+        .collect()
+}
+
+const NESTED_OBSERVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const NESTED_REEMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Debug, Default)]
+struct NestedObservation {
+    last_check: Option<std::time::Instant>,
+    last_emit: Option<std::time::Instant>,
+    last_observed: Vec<(u32, Agent)>,
+}
+
+impl NestedObservation {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Observe nested PTY agents on an independent cadence, decoupled from the
+/// single-agent probe schedule. Emits on change, and re-emits the unchanged
+/// set periodically: server-side expiry (report grace, working decay) is
+/// deadline-based and needs level-triggered reconciliation events — a single
+/// empty scan after reports stop would otherwise never be followed up and
+/// stale entries would survive forever.
+async fn maybe_publish_nested_agents(
+    state_events: &mpsc::Sender<AppEvent>,
+    pane_id: PaneId,
+    pid: u32,
+    observation: &mut NestedObservation,
+    now: std::time::Instant,
+) {
+    if observation
+        .last_check
+        .is_some_and(|at| now.duration_since(at) < NESTED_OBSERVE_INTERVAL)
+    {
+        return;
+    }
+    observation.last_check = Some(now);
+
+    let observed = nested_pty_agent_observations(pid);
+    let reemit_due = observation
+        .last_emit
+        .is_none_or(|at| now.duration_since(at) >= NESTED_REEMIT_INTERVAL);
+    if observed == observation.last_observed && !reemit_due {
+        return;
+    }
+    observation.last_observed.clone_from(&observed);
+    observation.last_emit = Some(now);
+    let _ = state_events
+        .send(AppEvent::NestedAgentsObserved {
+            pane_id,
+            agents: observed,
+        })
+        .await;
 }
 
 #[cfg(unix)]
@@ -828,6 +935,7 @@ fn spawn_basic_detection_task(
         let mut pending_idle = PendingIdleConfirmation::default();
         let mut last_codex_prompt_ready = false;
         let mut last_self_reported_shell_check = None;
+        let mut nested_observation = NestedObservation::default();
 
         loop {
             let sleep_duration = if pending_idle.active() {
@@ -860,6 +968,7 @@ fn spawn_basic_detection_task(
                     last_screen_scan_detection_content_seq = None;
                     agent_startup_grace_until = None;
                     pending_idle.clear();
+                    nested_observation.reset();
                 }
             }
 
@@ -983,6 +1092,17 @@ fn spawn_basic_detection_task(
                         }
                     }
                 }
+            }
+
+            if pid > 0 {
+                maybe_publish_nested_agents(
+                    &state_events,
+                    pane_id,
+                    pid,
+                    &mut nested_observation,
+                    now,
+                )
+                .await;
             }
 
             let process_exited = pending_foreground_shell_clear
@@ -2745,6 +2865,7 @@ impl PaneRuntime {
                 let mut pending_idle = PendingIdleConfirmation::default();
                 let mut last_codex_prompt_ready = false;
                 let mut last_self_reported_shell_check = None;
+                let mut nested_observation = NestedObservation::default();
 
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2787,6 +2908,7 @@ impl PaneRuntime {
                             last_screen_scan_detection_content_seq = None;
                             agent_startup_grace_until = None;
                             pending_idle.clear();
+                            nested_observation.reset();
                         }
                     }
 
@@ -2980,6 +3102,17 @@ impl PaneRuntime {
                         if render_dirty.request_pty(pane_id) {
                             render_notify.notify_one();
                         }
+                    }
+
+                    if pid > 0 {
+                        maybe_publish_nested_agents(
+                            &state_events,
+                            pane_id,
+                            pid,
+                            &mut nested_observation,
+                            now,
+                        )
+                        .await;
                     }
 
                     let process_exited = pending_foreground_shell_clear
@@ -5204,6 +5337,7 @@ mod tests {
             Some(99),
             Some(job),
             || None,
+            Vec::new,
             |pid| (pid == 99).then_some(Agent::Claude),
         );
 
@@ -5223,6 +5357,7 @@ mod tests {
             Some(99),
             None,
             || Some(job),
+            Vec::new,
             |pid| (pid == 99).then_some(Agent::Claude),
         );
 
@@ -5245,6 +5380,7 @@ mod tests {
             Some(99),
             None,
             || Some(job),
+            Vec::new,
             |pid| (pid == 100).then_some(Agent::Claude),
         );
 
@@ -5267,11 +5403,102 @@ mod tests {
             Some(99),
             None,
             || Some(job),
+            Vec::new,
             |pid| (pid == 100).then_some(Agent::Claude),
         );
 
         assert_eq!(result.agent, Some(Agent::Claude));
         assert_eq!(result.process_name.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn nested_pty_job_identifies_agent_when_foreground_job_is_not_an_agent() {
+        let outer_job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![foreground_process(99, "nvim")],
+        };
+        let nested_job = crate::platform::ForegroundJob {
+            process_group_id: 150,
+            processes: vec![foreground_process(150, "claude")],
+        };
+
+        let result = probe_foreground_process_from_jobs(
+            42,
+            Some(99),
+            None,
+            || Some(outer_job),
+            || vec![nested_job],
+            |_| None,
+        );
+
+        assert_eq!(result.agent, Some(Agent::Claude));
+        assert_eq!(result.process_name.as_deref(), Some("claude"));
+        assert_eq!(result.process_group_id, Some(99));
+        assert!(!result.foreground_is_pane_shell);
+    }
+
+    #[test]
+    fn nested_pty_agent_hint_identifies_agent_behind_wrapper() {
+        let outer_job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![foreground_process(99, "nvim")],
+        };
+        let nested_job = crate::platform::ForegroundJob {
+            process_group_id: 150,
+            processes: vec![foreground_process(150, "fence")],
+        };
+
+        let result = probe_foreground_process_from_jobs(
+            42,
+            Some(99),
+            None,
+            || Some(outer_job),
+            || vec![nested_job],
+            |pid| (pid == 150).then_some(Agent::Codex),
+        );
+
+        assert_eq!(result.agent, Some(Agent::Codex));
+        assert_eq!(result.process_name.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn nested_pty_jobs_are_not_consulted_when_foreground_job_is_an_agent() {
+        let outer_job = crate::platform::ForegroundJob {
+            process_group_id: 99,
+            processes: vec![foreground_process(99, "codex")],
+        };
+
+        let result = probe_foreground_process_from_jobs(
+            42,
+            Some(99),
+            None,
+            || Some(outer_job),
+            || panic!("nested PTY scan must not run for an identified foreground agent"),
+            |_| None,
+        );
+
+        assert_eq!(result.agent, Some(Agent::Codex));
+    }
+
+    #[test]
+    fn nested_pty_job_identifies_agent_without_foreground_job() {
+        let nested_job = crate::platform::ForegroundJob {
+            process_group_id: 150,
+            processes: vec![foreground_process(150, "claude")],
+        };
+
+        let result = probe_foreground_process_from_jobs(
+            42,
+            Some(99),
+            None,
+            || None,
+            || vec![nested_job],
+            |_| None,
+        );
+
+        assert_eq!(result.agent, Some(Agent::Claude));
+        assert_eq!(result.process_group_id, Some(99));
+        assert!(!result.foreground_is_pane_shell);
     }
 
     fn process_probe_input() -> ProcessProbeInput {

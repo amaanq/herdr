@@ -371,14 +371,18 @@ impl App {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane_state = ws.pane_state(pane_id)?;
         let terminal = self.state.terminals.get(&pane_state.attached_terminal_id)?;
-        if !terminal.is_agent_terminal() {
+        if !terminal.is_agent_terminal() && terminal.nested_agents.is_empty() {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
+        let agent = pane.agent.or_else(|| {
+            let nested = terminal.nested_agents.values().next()?;
+            Some(crate::detect::agent_label(nested.agent).to_string())
+        });
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
-            agent: pane.agent,
+            agent,
             title: pane.title,
             terminal_title: pane.terminal_title,
             terminal_title_stripped: pane.terminal_title_stripped,
@@ -394,7 +398,7 @@ impl App {
             focused: pane.focused,
             launch_pending: terminal.managed_agent_launch_pending(),
             interactive_ready: terminal.managed_agent_interactive_ready(),
-            state_change_seq: terminal.last_agent_state_change_seq.unwrap_or(0),
+            state_change_seq: terminal.pane_display_state_change_seq().unwrap_or(0),
             completion_seq: terminal.last_agent_completion_seq,
             cwd: pane.cwd,
             foreground_cwd: pane.foreground_cwd,
