@@ -111,6 +111,23 @@ pub enum AppEvent {
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
     },
+    /// Nested PTY agent sessions observed under a pane's process tree.
+    NestedAgentsObserved {
+        pane_id: PaneId,
+        agents: Vec<(u32, Agent)>,
+    },
+    /// Terminal text reported for a nested agent session in a pane.
+    NestedTerminalReported {
+        pane_id: PaneId,
+        session: u32,
+        pid: u32,
+        agent: Option<Agent>,
+        changed: bool,
+        text: String,
+        title: String,
+        visible: Option<bool>,
+        closed: bool,
+    },
     /// Agent session identity was reported without state authority.
     AgentSessionReported {
         pane_id: PaneId,

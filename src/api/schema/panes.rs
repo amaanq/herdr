@@ -379,6 +379,28 @@ pub struct PaneReportAgentParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneReportNestedTerminalParams {
+    pub pane_id: String,
+    /// Pid of any process running in the nested terminal (e.g. the embedded
+    /// terminal's job pid); the server resolves it to its PTY session.
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// False for heartbeat reports whose text did not change.
+    #[serde(default = "super::default_true")]
+    pub changed: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// Whether the editor currently displays this terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible: Option<bool>,
+    #[serde(default)]
+    pub closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneReportAgentSessionParams {
     pub pane_id: String,
     pub source: String,

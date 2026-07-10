@@ -62,6 +62,8 @@ pub enum Subscription {
     PaneExited {},
     #[serde(rename = "pane.agent_detected")]
     PaneAgentDetected {},
+    #[serde(rename = "pane.nested_terminal_focused")]
+    PaneNestedTerminalFocused {},
     #[serde(rename = "pane.output_matched")]
     PaneOutputMatched {
         pane_id: String,
@@ -216,6 +218,7 @@ pub enum EventKind {
     PaneOutputChanged,
     PaneExited,
     PaneAgentDetected,
+    PaneNestedTerminalFocused,
     PaneAgentStatusChanged,
     LayoutUpdated,
 }
@@ -247,6 +250,7 @@ impl EventKind {
             EventKind::PaneOutputChanged => "pane.output_changed",
             EventKind::PaneExited => "pane.exited",
             EventKind::PaneAgentDetected => "pane.agent_detected",
+            EventKind::PaneNestedTerminalFocused => "pane.nested_terminal_focused",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
             EventKind::LayoutUpdated => "layout.updated",
         }
@@ -279,6 +283,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneOutputChanged,
     EventKind::PaneExited,
     EventKind::PaneAgentDetected,
+    EventKind::PaneNestedTerminalFocused,
     EventKind::PaneAgentStatusChanged,
     EventKind::LayoutUpdated,
 ];
@@ -536,6 +541,14 @@ pub enum EventData {
         released: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         final_status: Option<AgentStatus>,
+    },
+    PaneNestedTerminalFocused {
+        pane_id: String,
+        workspace_id: String,
+        /// Nested PTY session id (its leader's pid) the user selected.
+        session: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
     },
     PaneAgentStatusChanged {
         pane_id: String,

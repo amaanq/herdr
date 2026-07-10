@@ -69,11 +69,22 @@ mod tests {
         parent_pty_fd_targets().len()
     }
 
+    // Distros without an FHS layout (NixOS) only guarantee /bin/sh.
+    fn cat_command() -> std::path::PathBuf {
+        std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|dir| dir.join("cat"))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| "/bin/cat".into())
+    }
+
     #[test]
     fn portable_pty_setup_leaves_one_parent_pty_fd() {
         let _guard = pty_fd_test_lock().lock().expect("pty fd test lock");
         let before = parent_pty_fd_count();
-        let mut cmd = CommandBuilder::new("/bin/cat");
+        let mut cmd = CommandBuilder::new(cat_command());
         cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
 
         let mut spawned =

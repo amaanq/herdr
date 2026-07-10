@@ -172,6 +172,11 @@ impl App {
                 workspace_id,
                 ..
             }
+            | EventData::PaneNestedTerminalFocused {
+                pane_id,
+                workspace_id,
+                ..
+            }
             | EventData::PaneAgentStatusChanged {
                 pane_id,
                 workspace_id,
