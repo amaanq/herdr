@@ -724,6 +724,15 @@ pub fn process_agent_hint(pid: u32) -> Option<crate::detect::Agent> {
     super::parse_agent_env_hint(&environ)
 }
 
+/// Read one variable from a process environment.
+pub fn process_env_value(pid: u32, name: &str) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    super::parse_env_value(&environ, name)
+}
+
 const NESTED_SESSION_ENTRIES_CACHE_TTL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

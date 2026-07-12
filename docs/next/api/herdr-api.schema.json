@@ -3144,6 +3144,15 @@
               "minimum": 0,
               "type": "integer"
             },
+            "slot": {
+              "description": "Slot this terminal occupies in the editor's numbered terminals, so a\nlater restore can put its agent back in the same one.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
             "text": {
               "type": "string"
             },
@@ -6072,6 +6081,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.take_nested_sessions",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.report_metadata",
               "type": "string"
             },
@@ -7915,6 +7940,62 @@
               "type": "object"
             }
           ]
+        },
+        "NestedSessionEnv": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "value"
+          ],
+          "type": "object"
+        },
+        "NestedSessionResume": {
+          "description": "A nested agent session ready to resume, with the agent's native resume\ncommand already composed by the server.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "argv": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "cwd": {
+              "description": "Directory the agent ran in. Claude Code and codex look sessions up\nper project directory, so a resume from anywhere else misses one\nrecorded in a subdirectory.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "env": {
+              "description": "Variables that pin the agent to the account it ran under.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/NestedSessionEnv"
+              },
+              "type": "array"
+            },
+            "slot": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "agent",
+            "argv"
+          ],
+          "type": "object"
         },
         "NotificationShowReason": {
           "enum": [
@@ -10034,6 +10115,25 @@
                 "content_revision",
                 "matches",
                 "total"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "sessions": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/NestedSessionResume"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "nested_sessions",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "sessions"
               ],
               "type": "object"
             },

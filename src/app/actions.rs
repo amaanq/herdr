@@ -1490,9 +1490,15 @@ impl AppState {
                 .collect(),
             AppEvent::NestedAgentsObserved { pane_id, agents } => {
                 let now = std::time::Instant::now();
+                let mut session_ref_changed = false;
                 self.update_terminal_nested_state(pane_id, |terminal| {
-                    terminal.reconcile_nested_agents(&agents, now)
+                    let mutation = terminal.reconcile_nested_agents(&agents, now);
+                    session_ref_changed = mutation.session_ref_changed;
+                    mutation
                 });
+                if session_ref_changed {
+                    self.mark_session_dirty();
+                }
                 Vec::new()
             }
             AppEvent::NestedTerminalReported {
@@ -1504,6 +1510,7 @@ impl AppState {
                 text,
                 title,
                 visible,
+                slot,
                 closed,
             } => {
                 let now = std::time::Instant::now();
@@ -1517,6 +1524,7 @@ impl AppState {
                             text: &text,
                             title: &title,
                             visible,
+                            slot,
                             closed,
                         },
                         now,
@@ -3939,6 +3947,57 @@ mod tests {
         assert_eq!(toast.kind, ToastKind::NeedsAttention);
         assert_eq!(toast.title, "hermes needs attention");
         assert_eq!(toast.context, "background · 2");
+    }
+
+    #[test]
+    fn nested_events_update_terminal_nested_agents() {
+        let mut state = app_with_workspaces(&["ws"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0]
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+
+        state.handle_app_event(AppEvent::NestedAgentsObserved {
+            pane_id,
+            agents: vec![(300, Agent::Claude)],
+        });
+        let terminal = state.terminals.get(&terminal_id).unwrap();
+        assert_eq!(terminal.nested_agents[&300].agent, Agent::Claude);
+        assert_eq!(terminal.nested_agents[&300].state, AgentState::Unknown);
+
+        state.handle_app_event(AppEvent::NestedTerminalReported {
+            pane_id,
+            session: 300,
+            pid: 300,
+            agent: None,
+            changed: true,
+            text: "plain output".into(),
+            title: String::new(),
+            visible: None,
+            slot: None,
+            closed: false,
+        });
+        let terminal = state.terminals.get(&terminal_id).unwrap();
+        assert_eq!(terminal.nested_agents[&300].state, AgentState::Working);
+        assert!(terminal.nested_agents[&300].last_state_change_seq.is_some());
+
+        state.handle_app_event(AppEvent::NestedTerminalReported {
+            pane_id,
+            session: 300,
+            pid: 300,
+            agent: None,
+            changed: false,
+            text: String::new(),
+            title: String::new(),
+            visible: None,
+            slot: None,
+            closed: true,
+        });
+        let terminal = state.terminals.get(&terminal_id).unwrap();
+        assert!(terminal.nested_agents.is_empty());
     }
 
     #[test]

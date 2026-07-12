@@ -134,6 +134,7 @@ const NESTED_MANIFEST_WORKING_DECAY: Duration = Duration::from_secs(10);
 /// scan reconciliation. Reports and the /proc scan race; heartbeats sustain
 /// live entries and dead ones expire once heartbeats stop.
 const NESTED_REPORT_GRACE: Duration = Duration::from_secs(5);
+const MAX_ORPHANED_NESTED_SESSIONS: usize = 8;
 
 /// An agent running on a nested PTY inside this terminal's process tree
 /// (e.g. an editor-embedded terminal). Identity and liveness come from the
@@ -152,6 +153,12 @@ pub struct NestedAgentEntry {
     /// Whether the embedding editor currently displays this terminal.
     /// `None` until a reporter says either way (scan-only entries).
     pub visible: Option<bool>,
+    /// Slot this terminal occupies among the editor's numbered terminals.
+    pub slot: Option<u32>,
+    /// Native conversation session reported by this nested agent's hooks.
+    /// Kept off the pane's own session slot so restore never resumes a
+    /// nested agent directly into the pane that hosted its editor.
+    pub session: Option<crate::agent_resume::PersistedAgentSession>,
     /// Whether the nested PTY scan has ever observed this session. Once it
     /// has, the scan is the removal authority: reports heartbeat for the
     /// terminal, not the agent, so they must not keep an exited agent's
@@ -176,6 +183,8 @@ impl NestedAgentEntry {
             last_state_change_seq: None,
             has_report: false,
             visible: None,
+            slot: None,
+            session: None,
             scan_confirmed: false,
             report_pid: None,
             last_report_at: None,
@@ -212,6 +221,7 @@ impl NestedAgentEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NestedAgentsMutation {
     pub changed: bool,
+    pub session_ref_changed: bool,
     pub state_changed_keys: Vec<u32>,
 }
 
@@ -231,6 +241,8 @@ pub struct NestedTerminalReport<'a> {
     pub title: &'a str,
     /// Whether the editor currently displays this terminal.
     pub visible: Option<bool>,
+    /// Slot this terminal occupies among the editor's numbered terminals.
+    pub slot: Option<u32>,
     pub closed: bool,
 }
 
@@ -276,6 +288,16 @@ pub struct TerminalState {
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
     pub restore_error: Option<String>,
     pub nested_agents: BTreeMap<u32, NestedAgentEntry>,
+    /// Nested agent sessions carried over from a restored herdr session,
+    /// waiting for the embedding editor to claim them via
+    /// `pane.take_nested_sessions`.
+    pub restored_nested_sessions: Vec<crate::agent_resume::NestedAgentSession>,
+    /// Sessions whose nested entries were removed while the agent may still
+    /// be alive (transient scan miss, identity flap, editor teardown racing
+    /// reports). A reappearing entry re-adopts from here instead of losing
+    /// the only copy of the resume ref. Deliberately not captured into
+    /// snapshots, so an agent that actually exited is not resurrected.
+    orphaned_nested_sessions: Vec<crate::agent_resume::PersistedAgentSession>,
 }
 
 impl TerminalState {
@@ -317,7 +339,23 @@ impl TerminalState {
             pending_agent_resume_plan: None,
             restore_error: None,
             nested_agents: BTreeMap::new(),
+            restored_nested_sessions: Vec::new(),
+            orphaned_nested_sessions: Vec::new(),
         }
+    }
+
+    pub fn with_restored_nested_sessions(
+        mut self,
+        sessions: Vec<crate::agent_resume::NestedAgentSession>,
+    ) -> Self {
+        self.restored_nested_sessions = sessions;
+        self
+    }
+
+    pub fn take_restored_nested_sessions(
+        &mut self,
+    ) -> Vec<crate::agent_resume::NestedAgentSession> {
+        std::mem::take(&mut self.restored_nested_sessions)
     }
 
     /// Whether a nested entry already tracks this session (by key or by the
@@ -328,6 +366,99 @@ impl TerminalState {
                 .nested_agents
                 .values()
                 .any(|entry| entry.report_pid == Some(session_or_pid))
+    }
+
+    fn adopt_nested_agent_session(
+        &mut self,
+        source: &str,
+        agent_label: &str,
+        session_ref: &crate::agent_resume::AgentSessionRef,
+    ) -> bool {
+        let Some(agent) = crate::detect::parse_agent_label(agent_label) else {
+            return false;
+        };
+        let target = self
+            .nested_agents
+            .iter_mut()
+            .filter(|(_, entry)| entry.agent == agent)
+            .reduce(|preferred, candidate| {
+                // Prefer a session-less instance; among several, the newest.
+                match (preferred.1.session.is_some(), candidate.1.session.is_some()) {
+                    (true, false) => candidate,
+                    (false, true) => preferred,
+                    _ => candidate,
+                }
+            });
+        let Some((_, entry)) = target else {
+            return false;
+        };
+        entry.session = Some(crate::agent_resume::PersistedAgentSession {
+            source: source.to_string(),
+            agent: agent_label.to_string(),
+            session_ref: session_ref.clone(),
+        });
+        true
+    }
+
+    /// A session reported before the scan first identified its nested agent
+    /// lands on the pane slot: `adopt_nested_agent_session` had no entry to
+    /// attach it to. Once the entry exists, persist would drop the session
+    /// from both places — the pane filter skips sessions whose agent runs
+    /// nested, and the entry carries none — so move it over when the scan
+    /// catches up.
+    fn retro_adopt_pane_session_into_nested(&mut self) -> bool {
+        let Some(session) = self.persisted_agent_session.as_ref() else {
+            return false;
+        };
+        let Some(agent) = crate::detect::parse_agent_label(&session.agent) else {
+            return false;
+        };
+        // No detected_agent guard: the pane-level probe falls back to nested
+        // PTY jobs, so an editor pane's detected_agent is usually the nested
+        // agent itself and matching on it would block the main path. The
+        // session-less-nested-entry requirement is what protects a pane whose
+        // own foreground runs the agent — such a pane has no nested entries.
+        if !self
+            .nested_agents
+            .values()
+            .any(|entry| entry.agent == agent && entry.session.is_none())
+        {
+            return false;
+        }
+        let session = session.clone();
+        if self.adopt_nested_agent_session(&session.source, &session.agent, &session.session_ref) {
+            self.persisted_agent_session = None;
+            return true;
+        }
+        false
+    }
+
+    fn retro_adopt_orphaned_session_into_nested(&mut self) -> bool {
+        let idx = self.orphaned_nested_sessions.iter().position(|session| {
+            crate::detect::parse_agent_label(&session.agent).is_some_and(|agent| {
+                self.nested_agents
+                    .values()
+                    .any(|entry| entry.agent == agent && entry.session.is_none())
+            })
+        });
+        let Some(idx) = idx else {
+            return false;
+        };
+        let session = self.orphaned_nested_sessions.remove(idx);
+        if self.adopt_nested_agent_session(&session.source, &session.agent, &session.session_ref) {
+            return true;
+        }
+        self.orphaned_nested_sessions.insert(idx, session);
+        false
+    }
+
+    fn park_nested_session(&mut self, session: crate::agent_resume::PersistedAgentSession) {
+        self.orphaned_nested_sessions
+            .retain(|parked| parked.session_ref != session.session_ref);
+        self.orphaned_nested_sessions.push(session);
+        if self.orphaned_nested_sessions.len() > MAX_ORPHANED_NESTED_SESSIONS {
+            self.orphaned_nested_sessions.remove(0);
+        }
     }
 
     /// Reconcile nested-agent entries against a fresh nested PTY scan.
@@ -342,6 +473,7 @@ impl TerminalState {
         now: Instant,
     ) -> NestedAgentsMutation {
         let mut mutation = NestedAgentsMutation::default();
+        let mut parked: Vec<crate::agent_resume::PersistedAgentSession> = Vec::new();
 
         for (session, agent) in observed {
             match self.nested_agents.get_mut(session) {
@@ -349,6 +481,7 @@ impl TerminalState {
                     entry.scan_confirmed = true;
                 }
                 Some(entry) => {
+                    parked.extend(entry.session.take());
                     *entry = NestedAgentEntry::new(*agent);
                     entry.scan_confirmed = true;
                     mutation.changed = true;
@@ -364,18 +497,35 @@ impl TerminalState {
             }
         }
 
-        let observed_keys: Vec<u32> = observed.iter().map(|(session, _)| *session).collect();
-        let before = self.nested_agents.len();
-        self.nested_agents.retain(|session, entry| {
-            observed_keys.contains(session)
-                || (!entry.scan_confirmed
-                    && entry.has_report
-                    && entry
-                        .last_report_at
-                        .is_some_and(|at| now.saturating_duration_since(at) <= NESTED_REPORT_GRACE))
-        });
-        if self.nested_agents.len() != before {
+        if self.retro_adopt_pane_session_into_nested()
+            || self.retro_adopt_orphaned_session_into_nested()
+        {
             mutation.changed = true;
+            mutation.session_ref_changed = true;
+        }
+
+        let observed_keys: Vec<u32> = observed.iter().map(|(session, _)| *session).collect();
+        let expired: Vec<u32> = self
+            .nested_agents
+            .iter()
+            .filter(|(session, entry)| {
+                !(observed_keys.contains(session)
+                    || (!entry.scan_confirmed
+                        && entry.has_report
+                        && entry.last_report_at.is_some_and(|at| {
+                            now.saturating_duration_since(at) <= NESTED_REPORT_GRACE
+                        })))
+            })
+            .map(|(session, _)| *session)
+            .collect();
+        for session in expired {
+            if let Some(entry) = self.nested_agents.remove(&session) {
+                parked.extend(entry.session);
+                mutation.changed = true;
+            }
+        }
+        for session in parked {
+            self.park_nested_session(session);
         }
 
         for (session, entry) in &mut self.nested_agents {
@@ -405,8 +555,12 @@ impl TerminalState {
                 (*key == report.session || entry.report_pid == Some(report.session)).then_some(*key)
             });
             if let Some(key) = key {
-                self.nested_agents.remove(&key);
-                mutation.changed = true;
+                if let Some(entry) = self.nested_agents.remove(&key) {
+                    if let Some(session) = entry.session {
+                        self.park_nested_session(session);
+                    }
+                    mutation.changed = true;
+                }
             }
             return mutation;
         }
@@ -430,6 +584,9 @@ impl TerminalState {
         if report.visible.is_some() && entry.visible != report.visible {
             entry.visible = report.visible;
             mutation.changed = true;
+        }
+        if report.slot.is_some() {
+            entry.slot = report.slot;
         }
 
         if report.changed && !report.text.is_empty() {
@@ -1860,6 +2017,18 @@ impl TerminalState {
         }
         if !unsequenced_selection && !self.accept_hook_report(&source, seq) {
             return None;
+        }
+        // Hooks inherit HERDR_PANE_ID through the embedding editor, so a
+        // nested agent's session report arrives addressed to the editor's
+        // pane. Attach it to the nested entry instead of the pane's own
+        // session slot, or restore would resume the agent into the pane in
+        // place of the editor.
+        if self.adopt_nested_agent_session(&source, &agent_label, &session_ref) {
+            return Some(TerminalStateMutation {
+                effective_state_change: None,
+                session_ref_changed: true,
+                agent_released: false,
+            });
         }
         if self.known_agent_label_conflicts_with_detected_agent(&agent_label) {
             return None;
@@ -6721,6 +6890,8 @@ mod tests {
             title: "",
             visible: None,
             closed: false,
+
+            slot: None,
         }
     }
 
@@ -6856,6 +7027,8 @@ mod tests {
                 title: "",
                 visible: None,
                 closed: true,
+
+                slot: None,
             },
             now,
         );
@@ -6878,6 +7051,8 @@ mod tests {
                 title: "",
                 visible: None,
                 closed: false,
+
+                slot: None,
             },
             now,
         );
@@ -6894,6 +7069,8 @@ mod tests {
                 title: "",
                 visible: None,
                 closed: true,
+
+                slot: None,
             },
             now,
         );
@@ -6916,6 +7093,8 @@ mod tests {
                 title: "",
                 visible: None,
                 closed: false,
+
+                slot: None,
             },
             now,
         );
@@ -6979,6 +7158,8 @@ mod tests {
             title: "codex",
             visible: Some(true),
             closed: false,
+
+            slot: None,
         };
 
         terminal.apply_nested_terminal_report(report("hello"), now);
@@ -6989,6 +7170,185 @@ mod tests {
             now + std::time::Duration::from_millis(500),
         );
         assert_eq!(terminal.nested_agents[&300].state, AgentState::Idle);
+    }
+
+    #[test]
+    fn nested_agent_session_report_attaches_to_nested_entry_not_pane() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        terminal.reconcile_nested_agents(&[(300, Agent::Claude)], now);
+
+        let mutation = terminal.set_agent_session_ref_for_session_start(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("123e4567-e89b-12d3-a456-426614174000"),
+            Some(1),
+            Some("startup".into()),
+        );
+
+        assert!(mutation.is_some_and(|m| m.session_ref_changed));
+        assert!(terminal.persisted_agent_session.is_none());
+        let session = terminal.nested_agents[&300]
+            .session
+            .as_ref()
+            .expect("session should attach to the nested entry");
+        assert_eq!(session.agent, "claude");
+    }
+
+    #[test]
+    fn pane_session_adoption_still_works_without_nested_entries() {
+        let mut terminal = test_terminal();
+
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("123e4567-e89b-12d3-a456-426614174000"),
+            Some(1),
+            Some("startup".into()),
+        );
+
+        assert!(terminal.persisted_agent_session.is_some());
+    }
+
+    #[test]
+    fn nested_scan_retro_adopts_session_reported_before_entry_existed() {
+        let mut terminal = test_terminal();
+
+        // The agent's session hook fires within its first second; the scan
+        // takes up to a cadence interval to identify the new nested PTY.
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("123e4567-e89b-12d3-a456-426614174000"),
+            Some(1),
+            Some("startup".into()),
+        );
+        assert!(terminal.persisted_agent_session.is_some());
+
+        let mutation = terminal.reconcile_nested_agents(&[(300, Agent::Claude)], Instant::now());
+
+        assert!(mutation.session_ref_changed);
+        assert!(terminal.persisted_agent_session.is_none());
+        let session = terminal.nested_agents[&300]
+            .session
+            .as_ref()
+            .expect("session should move to the nested entry");
+        assert_eq!(
+            session.session_ref.value,
+            "123e4567-e89b-12d3-a456-426614174000"
+        );
+    }
+
+    #[test]
+    fn retro_adoption_ignores_fallback_detected_agent() {
+        // The pane-level probe falls back to nested PTY jobs, so an editor
+        // pane hosting a nested claude reports detected_agent = Claude; the
+        // stranded session must move to the nested entry regardless.
+        let mut terminal = test_terminal();
+        terminal.detected_agent = Some(Agent::Claude);
+
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("123e4567-e89b-12d3-a456-426614174000"),
+            Some(1),
+            Some("startup".into()),
+        );
+
+        let mutation = terminal.reconcile_nested_agents(&[(300, Agent::Claude)], Instant::now());
+
+        assert!(mutation.session_ref_changed);
+        assert!(terminal.persisted_agent_session.is_none());
+        assert!(terminal.nested_agents[&300].session.is_some());
+    }
+
+    #[test]
+    fn retro_adoption_only_moves_sessions_whose_agent_runs_nested() {
+        let mut terminal = test_terminal();
+        terminal.detected_agent = Some(Agent::Claude);
+
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("123e4567-e89b-12d3-a456-426614174000"),
+            Some(1),
+            Some("startup".into()),
+        );
+
+        // only a codex runs nested; the claude session belongs to the pane
+        let mutation = terminal.reconcile_nested_agents(&[(300, Agent::Codex)], Instant::now());
+
+        assert!(!mutation.session_ref_changed);
+        assert!(terminal.persisted_agent_session.is_some());
+        assert!(terminal.nested_agents[&300].session.is_none());
+    }
+
+    #[test]
+    fn scan_hiccup_parks_session_and_readopts_on_reappearance() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        terminal.reconcile_nested_agents(&[(300, Agent::Claude)], now);
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("123e4567-e89b-12d3-a456-426614174000"),
+            Some(1),
+            Some("startup".into()),
+        );
+        assert!(terminal.nested_agents[&300].session.is_some());
+
+        // one transient empty scan removes the entry
+        terminal.reconcile_nested_agents(&[], now);
+        assert!(terminal.nested_agents.is_empty());
+
+        // the next scan still sees the live agent; the session must survive
+        let mutation = terminal.reconcile_nested_agents(&[(300, Agent::Claude)], now);
+
+        assert!(mutation.session_ref_changed);
+        let session = terminal.nested_agents[&300]
+            .session
+            .as_ref()
+            .expect("session should be re-adopted from the orphan list");
+        assert_eq!(
+            session.session_ref.value,
+            "123e4567-e89b-12d3-a456-426614174000"
+        );
+    }
+
+    #[test]
+    fn closed_report_parks_session_for_readoption() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        terminal.reconcile_nested_agents(&[(300, Agent::Claude)], now);
+        terminal.set_agent_session_ref_for_session_start(
+            "herdr:claude".into(),
+            "claude".into(),
+            crate::agent_resume::AgentSessionRef::id("123e4567-e89b-12d3-a456-426614174000"),
+            Some(1),
+            Some("startup".into()),
+        );
+
+        terminal.apply_nested_terminal_report(
+            NestedTerminalReport {
+                session: 300,
+                pid: 300,
+                agent: None,
+                changed: false,
+                text: "",
+                title: "",
+                visible: None,
+                closed: true,
+
+                slot: None,
+            },
+            now,
+        );
+        assert!(terminal.nested_agents.is_empty());
+
+        let mutation = terminal.reconcile_nested_agents(&[(300, Agent::Claude)], now);
+
+        assert!(mutation.session_ref_changed);
+        assert!(terminal.nested_agents[&300].session.is_some());
     }
 
     #[test]

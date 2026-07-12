@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use ratatui::layout::Direction;
@@ -107,6 +107,10 @@ pub struct PaneSnapshot {
     pub managed_agent_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<PaneAgentSessionSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_sessions: Vec<PaneAgentSessionSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_program: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_resume: Option<PaneAgentResumeSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,6 +130,12 @@ pub struct PaneAgentSessionSnapshot {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -351,25 +361,49 @@ fn capture_tab(
             .unwrap_or_default();
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
         let agent_session = terminal.and_then(|terminal| {
-            if let Some(authority) = terminal.hook_authority.as_ref() {
-                if let Some(session_ref) = authority.session_ref.as_ref() {
-                    return Some(PaneAgentSessionSnapshot {
-                        source: authority.source.clone(),
-                        agent: authority.agent_label.clone(),
-                        kind: session_ref.kind,
-                        value: session_ref.value.clone(),
-                    });
-                }
-            }
-            terminal
-                .persisted_agent_session
+            let session = terminal
+                .hook_authority
                 .as_ref()
-                .map(|session| PaneAgentSessionSnapshot {
-                    source: session.source.clone(),
-                    agent: session.agent.clone(),
-                    kind: session.session_ref.kind,
-                    value: session.session_ref.value.clone(),
+                .and_then(|authority| {
+                    authority
+                        .session_ref
+                        .as_ref()
+                        .map(|session_ref| PaneAgentSessionSnapshot {
+                            source: authority.source.clone(),
+                            agent: authority.agent_label.clone(),
+                            kind: session_ref.kind,
+                            value: session_ref.value.clone(),
+
+                            slot: None,
+                            cwd: None,
+
+                            env: Vec::new(),
+                        })
                 })
+                .or_else(|| {
+                    terminal.persisted_agent_session.as_ref().map(|session| {
+                        PaneAgentSessionSnapshot {
+                            source: session.source.clone(),
+                            agent: session.agent.clone(),
+                            kind: session.session_ref.kind,
+                            value: session.session_ref.value.clone(),
+
+                            slot: None,
+                            cwd: None,
+
+                            env: Vec::new(),
+                        }
+                    })
+                });
+            // A session whose agent runs nested belongs to the editor's
+            // terminal, not the pane: resuming it into the pane would
+            // replace the editor on restore.
+            session.filter(|session| {
+                !terminal
+                    .nested_agents
+                    .values()
+                    .any(|entry| crate::detect::agent_label(entry.agent) == session.agent)
+            })
         });
         let agent_resume = terminal
             .and_then(|terminal| terminal.reported_resume())
@@ -377,6 +411,52 @@ fn capture_tab(
                 source: resume.source.clone(),
                 agent: resume.agent.clone(),
                 argv: resume.argv.clone(),
+            });
+        let nested_sessions = terminal
+            .map(|terminal| {
+                let mut sessions: Vec<PaneAgentSessionSnapshot> = terminal
+                    .nested_agents
+                    .iter()
+                    .filter_map(|(session_id, entry)| {
+                        entry
+                            .session
+                            .as_ref()
+                            .map(|session| PaneAgentSessionSnapshot {
+                                source: session.source.clone(),
+                                agent: session.agent.clone(),
+                                kind: session.session_ref.kind,
+                                value: session.session_ref.value.clone(),
+                                slot: entry.slot,
+                                cwd: nested_session_cwd(*session_id),
+                                env: nested_session_env(*session_id, entry.agent),
+                            })
+                    })
+                    .collect();
+                sessions.extend(terminal.restored_nested_sessions.iter().map(|record| {
+                    PaneAgentSessionSnapshot {
+                        source: record.session.source.clone(),
+                        agent: record.session.agent.clone(),
+                        kind: record.session.session_ref.kind,
+                        value: record.session.session_ref.value.clone(),
+                        slot: record.slot,
+                        cwd: record.cwd.clone(),
+                        env: record.env.clone(),
+                    }
+                }));
+                order_nested_sessions(sessions)
+            })
+            .unwrap_or_default();
+        let foreground_program = tab
+            .panes
+            .get(id)
+            .and_then(|pane| terminal_runtimes.get(&pane.attached_terminal_id))
+            .and_then(|runtime| runtime.child_pid())
+            .and_then(crate::detect::foreground_job)
+            .and_then(|job| {
+                job.processes
+                    .iter()
+                    .find(|process| process.pid == job.process_group_id)
+                    .map(|process| process.name.clone())
             });
         panes.insert(
             id.raw(),
@@ -387,6 +467,8 @@ fn capture_tab(
                 managed_agent_kind,
                 agent_session,
                 agent_resume,
+                nested_sessions,
+                foreground_program,
                 launch_argv,
             },
         );
@@ -411,6 +493,52 @@ pub(super) fn layout_fingerprint(snapshot: &SessionSnapshot) -> Option<String> {
     value["collapsed_space_keys"] = serde_json::to_value(collapsed).ok()?;
     let bytes = serde_json::to_vec(&value).ok()?;
     Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn nested_session_pid(session: u32) -> u32 {
+    crate::detect::foreground_process_group_id(session).unwrap_or(session)
+}
+
+fn nested_session_cwd(session: u32) -> Option<String> {
+    crate::platform::process_cwd(nested_session_pid(session))
+        .map(|cwd| cwd.to_string_lossy().into_owned())
+}
+
+/// The wrappers that select an account export it into the agent process only,
+/// so this has to read the agent's own environment rather than the shell's.
+fn nested_session_env(session: u32, agent: crate::detect::Agent) -> Vec<(String, String)> {
+    let pid = nested_session_pid(session);
+    crate::integration::env::agent_account_env_vars(agent)
+        .iter()
+        .filter_map(|name| {
+            crate::platform::process_env_value(pid, name)
+                .filter(|value| !value.is_empty())
+                .map(|value| ((*name).to_string(), value))
+        })
+        .collect()
+}
+
+/// Restore rebuilds the editor's numbered terminals from this order, so a
+/// session must come back in the slot it occupied rather than wherever its
+/// pid happened to sort.
+fn order_nested_sessions(
+    mut sessions: Vec<PaneAgentSessionSnapshot>,
+) -> Vec<PaneAgentSessionSnapshot> {
+    let mut seen = HashSet::new();
+    sessions.retain(|session| seen.insert(session_snapshot_key(session)));
+    sessions.sort_by_key(|session| session.slot.unwrap_or(u32::MAX));
+    sessions
+}
+
+fn session_snapshot_key(session: &PaneAgentSessionSnapshot) -> String {
+    crate::agent_resume::dedupe_key(
+        &session.source,
+        &session.agent,
+        &crate::agent_resume::AgentSessionRef {
+            kind: session.kind,
+            value: session.value.clone(),
+        },
+    )
 }
 
 /// Capture pane screen history separately from the structural session snapshot.
@@ -706,6 +834,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 agent_resume: None,
+                nested_sessions: Vec::new(),
+                foreground_program: None,
                 launch_argv: None,
             },
         );
@@ -718,6 +848,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 agent_resume: None,
+                nested_sessions: Vec::new(),
+                foreground_program: None,
                 launch_argv: None,
             },
         );
@@ -1404,6 +1536,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 agent_resume: None,
+                nested_sessions: Vec::new(),
+                foreground_program: None,
                 launch_argv: None,
             },
         );
@@ -1418,6 +1552,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 agent_resume: None,
+                nested_sessions: Vec::new(),
+                foreground_program: None,
                 launch_argv: None,
             },
         );
@@ -1461,6 +1597,40 @@ mod tests {
         assert_eq!(
             restored.workspaces[0].tabs[0].panes[&0].cwd,
             PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test")
+        );
+    }
+
+    fn nested_session(agent: &str, value: &str, slot: Option<u32>) -> PaneAgentSessionSnapshot {
+        PaneAgentSessionSnapshot {
+            source: format!("herdr:{agent}"),
+            agent: agent.into(),
+            kind: crate::agent_resume::AgentSessionRefKind::Id,
+            value: value.into(),
+            slot,
+            cwd: None,
+            env: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn nested_sessions_restore_in_slot_order_without_duplicates() {
+        let ordered = order_nested_sessions(vec![
+            nested_session("codex", "codex-1", Some(3)),
+            nested_session("claude", "claude-1", Some(1)),
+            nested_session("claude", "claude-2", None),
+            nested_session("codex", "codex-1", Some(3)),
+        ]);
+
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|session| (session.value.as_str(), session.slot))
+                .collect::<Vec<_>>(),
+            vec![
+                ("claude-1", Some(1)),
+                ("codex-1", Some(3)),
+                ("claude-2", None),
+            ]
         );
     }
 }

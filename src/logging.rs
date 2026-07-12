@@ -113,6 +113,7 @@ fn is_routine_api_method(method: &str) -> bool {
             | "pane.report_agent"
             | "pane.report_agent_session"
             | "pane.report_nested_terminal"
+            | "pane.take_nested_sessions"
             | "pane.report_metadata"
     )
 }

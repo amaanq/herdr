@@ -95,6 +95,20 @@ pub struct PersistedAgentSession {
     pub session_ref: AgentSessionRef,
 }
 
+/// A nested agent's session plus the editor-side facts a restore needs to
+/// put it back where it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NestedAgentSession {
+    pub session: PersistedAgentSession,
+    pub slot: Option<u32>,
+    /// Directory the agent ran in. Claude Code and codex look sessions up
+    /// per project directory, so a resume from anywhere else misses one
+    /// recorded in a subdirectory.
+    pub cwd: Option<String>,
+    /// Account-selecting variables sampled from the agent's own environment.
+    pub env: Vec<(String, String)>,
+}
+
 impl AgentSessionRef {
     pub fn id(value: impl Into<String>) -> Option<Self> {
         let value = value.into();

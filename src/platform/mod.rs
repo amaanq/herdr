@@ -482,6 +482,20 @@ pub fn process_agent_hint(_pid: u32) -> Option<crate::detect::Agent> {
     None
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_env_value(_pid: u32, _name: &str) -> Option<String> {
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn parse_env_value(environ: &[u8], name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    environ
+        .split(|&byte| byte == 0)
+        .find_map(|record| record.strip_prefix(prefix.as_bytes()))
+        .map(|value| String::from_utf8_lossy(value).into_owned())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn parse_agent_env_hint(environ: &[u8]) -> Option<crate::detect::Agent> {
     for record in environ.split(|&byte| byte == 0) {
