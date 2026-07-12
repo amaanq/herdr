@@ -675,9 +675,16 @@ fn restore_terminal_state(
 
 #[cfg(not(windows))]
 fn push_keyboard_enhancement_flags() -> io::Result<()> {
+    let report_all_keys = crate::config::Config::load()
+        .config
+        .prefix_keys()
+        .iter()
+        .any(|(code, _)| matches!(code, crossterm::event::KeyCode::Modifier(_)));
     execute!(
         io::stdout(),
-        PushKeyboardEnhancementFlags(crate::input::ime_compatible_keyboard_enhancement_flags())
+        PushKeyboardEnhancementFlags(crate::input::prefix_keyboard_enhancement_flags(
+            report_all_keys,
+        ))
     )
 }
 
