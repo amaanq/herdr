@@ -25,6 +25,27 @@ pub(crate) const GROK_CONFIG_DIR_ENV_VAR: &str = "GROK_CONFIG_DIR";
 pub(crate) const GROK_HOME_ENV_VAR: &str = "GROK_HOME";
 pub(crate) const HERMES_HOME_ENV_VAR: &str = "HERMES_HOME";
 
+/// Variables that select which signed-in account an agent runs under, so a
+/// restored resume lands on the same one instead of the default config dir.
+pub(crate) fn agent_account_env_vars(agent: crate::detect::Agent) -> &'static [&'static str] {
+    use crate::detect::Agent;
+    match agent {
+        Agent::Claude => &[CLAUDE_CONFIG_DIR_ENV_VAR],
+        Agent::Codex => &[CODEX_HOME_ENV_VAR],
+        Agent::Pi => &[PI_CODING_AGENT_DIR_ENV_VAR],
+        Agent::Omp => &[OMP_CONFIG_DIR_ENV_VAR],
+        Agent::Kimi => &[KIMI_CODE_HOME_ENV_VAR],
+        Agent::GithubCopilot => &[COPILOT_HOME_ENV_VAR],
+        Agent::Qodercli => &[QODERCLI_CONFIG_DIR_ENV_VAR],
+        Agent::Qwen => &[QWEN_HOME_ENV_VAR],
+        Agent::Cursor => &[CURSOR_CONFIG_DIR_ENV_VAR],
+        Agent::Antigravity => &[ANTIGRAVITY_CLI_CONFIG_DIR_ENV_VAR],
+        Agent::Grok => &[GROK_CONFIG_DIR_ENV_VAR, GROK_HOME_ENV_VAR],
+        Agent::Hermes => &[HERMES_HOME_ENV_VAR],
+        _ => &[],
+    }
+}
+
 pub(crate) fn apply_pane_base_env(cmd: &mut CommandBuilder) {
     cmd.env(crate::api::SOCKET_PATH_ENV_VAR, crate::api::socket_path());
     if let Ok(executable) = crate::platform::launch_executable() {

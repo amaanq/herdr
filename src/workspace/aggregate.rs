@@ -321,6 +321,7 @@ mod tests {
                 title: "",
                 visible: None,
                 closed: false,
+                slot: None,
             },
             now,
         );

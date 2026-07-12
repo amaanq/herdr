@@ -645,6 +645,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneReportAgent(_) => "pane.report_agent",
         Method::PaneReportAgentSession(_) => "pane.report_agent_session",
         Method::PaneReportNestedTerminal(_) => "pane.report_nested_terminal",
+        Method::PaneTakeNestedSessions(_) => "pane.take_nested_sessions",
         Method::PaneReportMetadata(_) => "pane.report_metadata",
         Method::PaneClearAgentAuthority(_) => "pane.clear_agent_authority",
         Method::PaneReleaseAgent(_) => "pane.release_agent",

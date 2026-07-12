@@ -1764,10 +1764,65 @@ impl App {
             text,
             title: params.title,
             visible: params.visible,
+            slot: params.slot,
             closed: params.closed,
         });
 
         encode_success(id, ResponseResult::Ok {})
+    }
+
+    pub(super) fn handle_pane_take_nested_sessions(
+        &mut self,
+        id: String,
+        params: PaneTarget,
+    ) -> String {
+        let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let Some(terminal_id) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|ws| ws.pane_state(pane_id))
+            .map(|pane| pane.attached_terminal_id.clone())
+        else {
+            return pane_not_found(id, &params.pane_id);
+        };
+        let taken = self
+            .state
+            .terminals
+            .get_mut(&terminal_id)
+            .map(|terminal| terminal.take_restored_nested_sessions())
+            .unwrap_or_default();
+        let sessions: Vec<crate::api::schema::NestedSessionResume> = taken
+            .iter()
+            .filter_map(|record| {
+                crate::agent_resume::plan(
+                    &record.session.source,
+                    &record.session.agent,
+                    &record.session.session_ref,
+                )
+                .map(|plan| crate::api::schema::NestedSessionResume {
+                    agent: record.session.agent.clone(),
+                    argv: plan.argv,
+                    slot: record.slot,
+                    cwd: record.cwd.clone(),
+                    env: record
+                        .env
+                        .iter()
+                        .map(|(name, value)| crate::api::schema::NestedSessionEnv {
+                            name: name.clone(),
+                            value: value.clone(),
+                        })
+                        .collect(),
+                })
+            })
+            .collect();
+        if !taken.is_empty() {
+            self.state.mark_session_dirty();
+        }
+
+        encode_success(id, ResponseResult::NestedSessions { sessions })
     }
 
     pub(super) fn handle_pane_report_metadata(

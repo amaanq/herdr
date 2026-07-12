@@ -826,7 +826,7 @@ fn nested_pty_foreground_jobs(pid: u32) -> Vec<crate::platform::ForegroundJob> {
 /// Identify every agent running on a nested PTY under `pid`, keyed by the
 /// nested session id (its leader's pid). Unlike the single-slot probe
 /// fallback, this reports all of them so pane state can track each one.
-fn nested_pty_agent_observations(pid: u32) -> Vec<(u32, Agent)> {
+fn nested_pty_agent_observations(pid: u32) -> Vec<(u32, Agent, Option<String>)> {
     crate::platform::nested_pty_session_leaders(pid)
         .into_iter()
         .filter_map(|leader| {
@@ -836,19 +836,46 @@ fn nested_pty_agent_observations(pid: u32) -> Vec<(u32, Agent)> {
                     .or_else(|| {
                         crate::detect::identify_agent_in_job(&job).map(|(agent, _)| agent)
                     })?;
-            Some((leader, agent))
+            let session_id = argv_resume_session_id(agent, &job);
+            Some((leader, agent, session_id))
         })
         .collect()
 }
 
-const NESTED_OBSERVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Session id carried in a resumed agent's own argv. Not every agent reports
+/// its session at startup — codex defers its session_start hook to the first
+/// turn, so a freshly resumed `codex resume <id>` that hasn't been prompted
+/// yet is invisible to hooks. For resumed agents the argv is authoritative.
+fn argv_resume_session_id(agent: Agent, job: &crate::platform::ForegroundJob) -> Option<String> {
+    let flag = match agent {
+        Agent::Claude => "--resume",
+        Agent::Codex => "resume",
+        _ => return None,
+    };
+    job.processes.iter().find_map(|process| {
+        let argv = process.argv.as_ref()?;
+        let pos = argv.iter().position(|arg| arg == flag)?;
+        let id = argv.get(pos + 1)?;
+        let valid = !id.is_empty()
+            && id.len() <= 512
+            && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-');
+        valid.then(|| id.clone())
+    })
+}
+
+// Bounded below by the detection loops' 250-500ms cadence and kept cheap by
+// the global /proc snapshot cache; this interval is what the user perceives
+// as panel-row removal latency when a nested agent exits back to its shell.
+// Removal after a single missed scan is safe at this rate because wiped
+// sessions park in the orphan list and re-adopt on reappearance.
+const NESTED_OBSERVE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 const NESTED_REEMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Default)]
 struct NestedObservation {
     last_check: Option<std::time::Instant>,
     last_emit: Option<std::time::Instant>,
-    last_observed: Vec<(u32, Agent)>,
+    last_observed: Vec<(u32, Agent, Option<String>)>,
 }
 
 impl NestedObservation {
@@ -882,17 +909,44 @@ async fn maybe_publish_nested_agents(
     let reemit_due = observation
         .last_emit
         .is_none_or(|at| now.duration_since(at) >= NESTED_REEMIT_INTERVAL);
-    if observed == observation.last_observed && !reemit_due {
+    let changed = observed != observation.last_observed;
+    if !changed && !reemit_due {
         return;
     }
     observation.last_observed.clone_from(&observed);
     observation.last_emit = Some(now);
+    let agents: Vec<(u32, Agent)> = observed
+        .iter()
+        .map(|(session, agent, _)| (*session, *agent))
+        .collect();
     let _ = state_events
-        .send(AppEvent::NestedAgentsObserved {
-            pane_id,
-            agents: observed,
-        })
+        .send(AppEvent::NestedAgentsObserved { pane_id, agents })
         .await;
+    if !changed {
+        return;
+    }
+    // After the observed event, so the entries exist and the report adopts
+    // into them instead of landing on the pane slot. seq None defers to any
+    // real hook report that already claimed the source's sequence.
+    for (_, agent, session_id) in &observed {
+        let Some(session_id) = session_id else {
+            continue;
+        };
+        let Some(session_ref) = crate::agent_resume::AgentSessionRef::id(session_id.clone()) else {
+            continue;
+        };
+        let agent_label = crate::detect::agent_label(*agent);
+        let _ = state_events
+            .send(AppEvent::AgentSessionReported {
+                pane_id,
+                source: format!("herdr:{agent_label}"),
+                agent_label: agent_label.to_string(),
+                seq: None,
+                session_ref: Some(session_ref),
+                session_start_source: Some("resume".to_string()),
+            })
+            .await;
+    }
 }
 
 #[cfg(unix)]
@@ -4272,6 +4326,57 @@ mod tests {
         *runtime.reported_cwd.lock().unwrap() = Some(cwd.clone());
 
         assert_eq!(runtime.follow_cwd(), Some(cwd));
+    }
+
+    fn argv_job(argv: Vec<&str>) -> crate::platform::ForegroundJob {
+        crate::platform::ForegroundJob {
+            process_group_id: 1,
+            processes: vec![crate::platform::ForegroundProcess {
+                pid: 1,
+                name: "agent".into(),
+                argv0: None,
+                argv: Some(argv.into_iter().map(String::from).collect()),
+                cmdline: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn argv_resume_session_id_extracts_resumed_ids() {
+        assert_eq!(
+            argv_resume_session_id(
+                Agent::Claude,
+                &argv_job(vec!["claude", "--resume", "ab-12"])
+            ),
+            Some("ab-12".into())
+        );
+        assert_eq!(
+            argv_resume_session_id(
+                Agent::Codex,
+                &argv_job(vec!["codex", "-c", "a=b", "resume", "019f5227"])
+            ),
+            Some("019f5227".into())
+        );
+    }
+
+    #[test]
+    fn argv_resume_session_id_rejects_non_id_forms() {
+        assert_eq!(
+            argv_resume_session_id(Agent::Codex, &argv_job(vec!["codex", "resume", "--last"])),
+            None
+        );
+        assert_eq!(
+            argv_resume_session_id(Agent::Claude, &argv_job(vec!["claude", "-c"])),
+            None
+        );
+        // a shell hosting the resume keeps it inside one -e payload element
+        assert_eq!(
+            argv_resume_session_id(
+                Agent::Claude,
+                &argv_job(vec!["nu", "-e", "claude --resume x"])
+            ),
+            None
+        );
     }
 
     #[test]

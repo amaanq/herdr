@@ -1161,6 +1161,9 @@ impl App {
             Method::PaneReportNestedTerminal(params) => {
                 return self.handle_pane_report_nested_terminal(request.id, params);
             }
+            Method::PaneTakeNestedSessions(params) => {
+                return self.handle_pane_take_nested_sessions(request.id, params);
+            }
             Method::PaneReportMetadata(params) => {
                 return self.handle_pane_report_metadata(request.id, params);
             }

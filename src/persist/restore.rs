@@ -35,10 +35,18 @@ struct PaneRestoreStartup<'a> {
     reserved_agent_session: Option<String>,
 }
 
+/// Restore-time behavior toggles sourced from config.
+#[derive(Clone, Copy)]
+pub struct RestorePolicy<'a> {
+    pub resume_agents_on_restore: bool,
+    pub restore_commands: &'a std::collections::HashMap<String, Vec<String>>,
+}
+
 struct RestoreRuntimeContext<'a> {
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'a>,
     resume_agents_on_restore: bool,
+    restore_commands: &'a std::collections::HashMap<String, Vec<String>>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
@@ -71,7 +79,7 @@ pub fn restore(
     scrollback_limit_bytes: usize,
     default_shell: &str,
     shell_mode: crate::config::ShellModeConfig,
-    resume_agents_on_restore: bool,
+    policy: RestorePolicy<'_>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
@@ -84,7 +92,7 @@ pub fn restore(
         cols,
         scrollback_limit_bytes,
         crate::pane::PaneShellConfig::new(default_shell, shell_mode),
-        resume_agents_on_restore,
+        policy,
         &mut imported_panes,
         events,
         render_notify,
@@ -98,6 +106,7 @@ pub fn restore_handoff(
     scrollback_limit_bytes: usize,
     default_shell: &str,
     shell_mode: crate::config::ShellModeConfig,
+    restore_commands: &std::collections::HashMap<String, Vec<String>>,
     imports: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
@@ -110,7 +119,10 @@ pub fn restore_handoff(
         80,
         scrollback_limit_bytes,
         crate::pane::PaneShellConfig::new(default_shell, shell_mode),
-        true,
+        RestorePolicy {
+            resume_agents_on_restore: true,
+            restore_commands,
+        },
         imports,
         events,
         render_notify,
@@ -193,7 +205,7 @@ fn restore_with_imports_strict(
     cols: u16,
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'_>,
-    resume_agents_on_restore: bool,
+    policy: RestorePolicy<'_>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
@@ -206,7 +218,7 @@ fn restore_with_imports_strict(
         cols,
         scrollback_limit_bytes,
         shell_config,
-        resume_agents_on_restore,
+        policy,
         imported_panes,
         events,
         render_notify,
@@ -233,7 +245,7 @@ fn restore_with_imports(
     cols: u16,
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'_>,
-    resume_agents_on_restore: bool,
+    policy: RestorePolicy<'_>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
@@ -246,7 +258,7 @@ fn restore_with_imports(
         cols,
         scrollback_limit_bytes,
         shell_config,
-        resume_agents_on_restore,
+        policy,
         imported_panes,
         events,
         render_notify,
@@ -262,7 +274,7 @@ fn restore_with_imports_and_failures(
     cols: u16,
     scrollback_limit_bytes: usize,
     shell_config: crate::pane::PaneShellConfig<'_>,
-    resume_agents_on_restore: bool,
+    policy: RestorePolicy<'_>,
     imported_panes: &mut HashMap<u32, crate::handoff_runtime::ImportedHandoffRuntime>,
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
@@ -285,7 +297,8 @@ fn restore_with_imports_and_failures(
         let runtime_context = RestoreRuntimeContext {
             scrollback_limit_bytes,
             shell_config,
-            resume_agents_on_restore,
+            resume_agents_on_restore: policy.resume_agents_on_restore,
+            restore_commands: policy.restore_commands,
             events: events.clone(),
             render_notify: render_notify.clone(),
             render_dirty: render_dirty.clone(),
@@ -542,6 +555,30 @@ fn restore_tab(
         let saved_launch_argv = saved_pane.and_then(|p| p.launch_argv.clone());
         let saved_agent_session = saved_pane.and_then(|p| p.agent_session.as_ref());
         let saved_agent_resume = saved_pane.and_then(saved_reported_resume);
+        let saved_foreground_program = saved_pane.and_then(|p| p.foreground_program.as_deref());
+        let restored_nested_sessions: Vec<crate::agent_resume::NestedAgentSession> = saved_pane
+            .map(|p| {
+                p.nested_sessions
+                    .iter()
+                    .filter_map(|session| {
+                        crate::agent_resume::session_ref_from_snapshot(
+                            &session.source,
+                            &session.agent,
+                            session.kind,
+                            &session.value,
+                        )
+                        .map(|restored| {
+                            crate::agent_resume::NestedAgentSession {
+                                session: restored,
+                                slot: session.slot,
+                                cwd: session.cwd.clone(),
+                                env: session.env.clone(),
+                            }
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let saved_history =
             old_id.and_then(|old_id| history.and_then(|history| history.panes.get(old_id)));
         let startup = {
@@ -566,6 +603,24 @@ fn restore_tab(
             .restore_plan
             .as_ref()
             .and_then(|plan| crate::detect::parse_agent_label(&plan.agent));
+        // No agent to resume, but the pane ran a configured program (e.g.
+        // nvim): relaunch it through the same deferred-spawn path so the
+        // command is typed into the pane's fresh shell.
+        let program_restore_plan = if startup.restore_plan.is_none() {
+            saved_foreground_program.and_then(|program| {
+                runtime_context
+                    .restore_commands
+                    .get(program)
+                    .filter(|argv| !argv.is_empty())
+                    .map(|argv| crate::agent_resume::AgentResumePlan {
+                        agent: program.to_string(),
+                        argv: argv.clone(),
+                        dedupe_key: format!("program:{}:{}", program, id.raw()),
+                    })
+            })
+        } else {
+            None
+        };
 
         let old_pane_id = reverse_id_map.get(id).copied();
         let public_pane_id = old_pane_id
@@ -589,12 +644,13 @@ fn restore_tab(
         let pending_native_agent_restore = if was_imported {
             None
         } else {
-            startup.restore_plan.clone()
+            startup.restore_plan.clone().or(program_restore_plan)
         };
         if let Some(plan) = pending_native_agent_restore {
             let terminal_id = TerminalId::alloc();
             let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
-                .with_pending_agent_resume_plan(plan);
+                .with_pending_agent_resume_plan(plan)
+                .with_restored_nested_sessions(restored_nested_sessions);
             if let Some(label) = saved_label {
                 terminal.set_manual_label(label);
             }
@@ -689,7 +745,8 @@ fn restore_tab(
         match runtime_result {
             Ok(runtime) => {
                 let terminal_id = TerminalId::alloc();
-                let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
+                let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone())
+                    .with_restored_nested_sessions(restored_nested_sessions);
                 if was_imported {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
@@ -1178,6 +1235,11 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: pi_session_path.clone(),
+
+            slot: None,
+            cwd: None,
+
+            env: Vec::new(),
         };
 
         assert!(restore_plan_for_snapshot(&session, false).is_none());
@@ -1191,6 +1253,11 @@ mod tests {
             agent: "claude".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("claude-session"),
+
+            slot: None,
+            cwd: None,
+
+            env: Vec::new(),
         };
         assert!(restore_plan_for_snapshot(&unsupported_path, true).is_none());
     }
@@ -1203,6 +1270,11 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: pi_session_path.clone(),
+
+            slot: None,
+            cwd: None,
+
+            env: Vec::new(),
         };
         let mut resumed = HashSet::new();
 
@@ -1225,6 +1297,11 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+
+            slot: None,
+            cwd: None,
+
+            env: Vec::new(),
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1256,6 +1333,11 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+
+            slot: None,
+            cwd: None,
+
+            env: Vec::new(),
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1296,6 +1378,9 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+            slot: None,
+            cwd: None,
+            env: Vec::new(),
         };
         let resume = super::super::snapshot::PaneAgentResumeSnapshot {
             source: "herdr:pi".into(),
@@ -1369,6 +1454,11 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+
+            slot: None,
+            cwd: None,
+
+            env: Vec::new(),
         };
         let history = super::super::snapshot::PaneHistorySnapshot {
             ansi: "RESTORED_HISTORY\r\n".into(),
@@ -1401,6 +1491,11 @@ mod tests {
             agent: "hermes".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Id,
             value: "hermes-session".into(),
+
+            slot: None,
+            cwd: None,
+
+            env: Vec::new(),
         };
 
         let preserved = restored_terminal_agent_session(Some(&session), false)
@@ -1417,6 +1512,11 @@ mod tests {
             agent: "pi".into(),
             kind: crate::agent_resume::AgentSessionRefKind::Path,
             value: test_session_path("pi-session.jsonl"),
+
+            slot: None,
+            cwd: None,
+
+            env: Vec::new(),
         };
         let mut resumed = HashSet::new();
         assert!(take_restore_plan_for_snapshot(&session, true, &mut resumed).is_some());
@@ -1459,6 +1559,9 @@ mod tests {
                 agent: "opencode".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "keep-my-session".into(),
+                slot: None,
+                cwd: None,
+                env: Vec::new(),
             });
             let (events, _rx) = mpsc::channel(32);
             let (workspaces, terminals, runtimes) = restore(
@@ -1473,7 +1576,10 @@ mod tests {
                     test_restore_shell()
                 },
                 crate::config::ShellModeConfig::NonLogin,
-                false,
+                RestorePolicy {
+                    resume_agents_on_restore: false,
+                    restore_commands: &HashMap::new(),
+                },
                 events,
                 Arc::new(Notify::new()),
                 Arc::new(RenderSignal::new()),
@@ -1525,6 +1631,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_relaunches_configured_program_and_carries_nested_sessions() {
+        let cwd = std::env::current_dir().unwrap();
+        let snapshot = SessionSnapshot {
+            version: super::super::snapshot::SNAPSHOT_VERSION,
+            workspaces: vec![WorkspaceSnapshot {
+                id: Some("workspace".into()),
+                custom_name: None,
+                identity_cwd: cwd.clone(),
+                worktree_space: None,
+                public_pane_numbers: HashMap::new(),
+                next_public_pane_number: 0,
+                public_tab_numbers: Vec::new(),
+                next_public_tab_number: 0,
+                tabs: vec![TabSnapshot {
+                    custom_name: None,
+                    layout: LayoutSnapshot::Pane(0),
+                    panes: HashMap::from([(
+                        0,
+                        super::super::snapshot::PaneSnapshot {
+                            cwd,
+                            label: None,
+                            agent_name: None,
+                            managed_agent_kind: None,
+                            agent_session: None,
+                            nested_sessions: vec![
+                                super::super::snapshot::PaneAgentSessionSnapshot {
+                                    source: "herdr:claude".into(),
+                                    agent: "claude".into(),
+                                    kind: crate::agent_resume::AgentSessionRefKind::Id,
+                                    value: "123e4567-e89b-12d3-a456-426614174000".into(),
+
+                                    slot: None,
+                                    cwd: None,
+
+                                    env: Vec::new(),
+                                },
+                            ],
+                            foreground_program: Some("nvim".into()),
+                            agent_resume: None,
+                            launch_argv: None,
+                        },
+                    )]),
+                    zoomed: false,
+                    focused: Some(0),
+                    root_pane: Some(0),
+                }],
+                active_tab: 0,
+            }],
+            active: Some(0),
+            selected: 0,
+            sidebar_width: None,
+            sidebar_section_split: None,
+            collapsed_space_keys: Default::default(),
+        };
+        let (events, _event_rx) = mpsc::channel(4);
+        let restore_commands = std::collections::HashMap::from([(
+            "nvim".to_string(),
+            vec!["nvim".to_string(), "+lua load()".to_string()],
+        )]);
+
+        let (_workspaces, terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            0,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            RestorePolicy {
+                resume_agents_on_restore: true,
+                restore_commands: &restore_commands,
+            },
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+
+        let terminal = terminals.values().next().expect("terminal restored");
+        let plan = terminal
+            .pending_agent_resume_plan
+            .as_ref()
+            .expect("program restore should defer a relaunch plan");
+        assert_eq!(plan.agent, "nvim");
+        assert_eq!(
+            plan.argv,
+            vec!["nvim".to_string(), "+lua load()".to_string()]
+        );
+        assert_eq!(terminal.restored_nested_sessions.len(), 1);
+        assert_eq!(terminal.restored_nested_sessions[0].session.agent, "claude");
+        assert!(
+            runtimes.is_empty(),
+            "deferred program relaunch should not spawn a runtime yet"
+        );
+    }
+
+    #[tokio::test]
     async fn restore_carries_persisted_agent_session_metadata() {
         let cwd = std::env::current_dir().unwrap();
         let snapshot = SessionSnapshot {
@@ -1553,8 +1755,15 @@ mod tests {
                                 agent: "opencode".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "opencode-session".into(),
+
+                                slot: None,
+                                cwd: None,
+
+                                env: Vec::new(),
                             }),
                             agent_resume: None,
+                            nested_sessions: Vec::new(),
+                            foreground_program: None,
                             launch_argv: None,
                         },
                     )]),
@@ -1580,7 +1789,10 @@ mod tests {
             0,
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
-            false,
+            RestorePolicy {
+                resume_agents_on_restore: false,
+                restore_commands: &HashMap::new(),
+            },
             events,
             Arc::new(Notify::new()),
             Arc::new(RenderSignal::new()),
@@ -1637,6 +1849,8 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 agent_resume: None,
+                                nested_sessions: Vec::new(),
+                                foreground_program: None,
                                 launch_argv: None,
                             },
                         ),
@@ -1649,6 +1863,8 @@ mod tests {
                                 managed_agent_kind: None,
                                 agent_session: None,
                                 agent_resume: None,
+                                nested_sessions: Vec::new(),
+                                foreground_program: None,
                                 launch_argv: None,
                             },
                         ),
@@ -1675,7 +1891,10 @@ mod tests {
             0,
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
-            false,
+            RestorePolicy {
+                resume_agents_on_restore: false,
+                restore_commands: &HashMap::new(),
+            },
             events,
             Arc::new(Notify::new()),
             Arc::new(RenderSignal::new()),
@@ -1703,6 +1922,8 @@ mod tests {
                     managed_agent_kind: None,
                     agent_session: None,
                     agent_resume: None,
+                    nested_sessions: Vec::new(),
+                    foreground_program: None,
                     launch_argv: None,
                 },
             )
@@ -1717,8 +1938,15 @@ mod tests {
                 agent: "codex".into(),
                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                 value: "codex-session".into(),
+
+                slot: None,
+                cwd: None,
+
+                env: Vec::new(),
             }),
             agent_resume: None,
+            nested_sessions: Vec::new(),
+            foreground_program: None,
             launch_argv: None,
         };
         let snapshot = SessionSnapshot {
@@ -1784,7 +2012,10 @@ mod tests {
             0,
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
-            false,
+            RestorePolicy {
+                resume_agents_on_restore: false,
+                restore_commands: &HashMap::new(),
+            },
             events,
             Arc::new(Notify::new()),
             Arc::new(RenderSignal::new()),
@@ -1869,8 +2100,15 @@ mod tests {
                                 agent: "codex".into(),
                                 kind: crate::agent_resume::AgentSessionRefKind::Id,
                                 value: "codex-session".into(),
+
+                                slot: None,
+                                cwd: None,
+
+                                env: Vec::new(),
                             }),
                             agent_resume: None,
+                            nested_sessions: Vec::new(),
+                            foreground_program: None,
                             launch_argv: None,
                         },
                     )]),
@@ -1896,7 +2134,10 @@ mod tests {
             0,
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
-            true,
+            RestorePolicy {
+                resume_agents_on_restore: true,
+                restore_commands: &HashMap::new(),
+            },
             events,
             Arc::new(Notify::new()),
             Arc::new(RenderSignal::new()),
@@ -1924,6 +2165,7 @@ mod tests {
             0,
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
+            &std::collections::HashMap::new(),
             &mut imports,
             mpsc::channel(4).0,
             Arc::new(Notify::new()),
@@ -1958,7 +2200,10 @@ mod tests {
                 4096,
                 test_restore_shell(),
                 crate::config::ShellModeConfig::NonLogin,
-                false,
+                RestorePolicy {
+                    resume_agents_on_restore: false,
+                    restore_commands: &HashMap::new(),
+                },
                 events.clone(),
                 Arc::new(Notify::new()),
                 Arc::new(RenderSignal::new()),
@@ -2008,6 +2253,7 @@ mod tests {
                 4096,
                 test_restore_shell(),
                 crate::config::ShellModeConfig::NonLogin,
+                &HashMap::new(),
                 &mut imports,
                 events,
                 Arc::new(Notify::new()),
@@ -2061,7 +2307,10 @@ mod tests {
             4096,
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
-            false,
+            RestorePolicy {
+                resume_agents_on_restore: false,
+                restore_commands: &HashMap::new(),
+            },
             events,
             render_notify,
             render_dirty,
@@ -2099,7 +2348,10 @@ mod tests {
             4096,
             test_restore_shell(),
             crate::config::ShellModeConfig::NonLogin,
-            false,
+            RestorePolicy {
+                resume_agents_on_restore: false,
+                restore_commands: &HashMap::new(),
+            },
             events,
             render_notify,
             render_dirty,
@@ -2147,7 +2399,10 @@ mod tests {
                 4096,
                 test_restore_shell(),
                 crate::config::ShellModeConfig::NonLogin,
-                false,
+                RestorePolicy {
+                    resume_agents_on_restore: false,
+                    restore_commands: &HashMap::new(),
+                },
                 events,
                 Arc::new(Notify::new()),
                 Arc::new(RenderSignal::new()),
@@ -2177,6 +2432,8 @@ mod tests {
                 managed_agent_kind: None,
                 agent_session: None,
                 agent_resume: None,
+                nested_sessions: Vec::new(),
+                foreground_program: None,
                 launch_argv: None,
             },
         );
