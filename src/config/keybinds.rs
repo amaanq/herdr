@@ -1,6 +1,6 @@
 #[cfg(test)]
 use crossterm::event::KeyEvent;
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers, ModifierKeyCode};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -1172,6 +1172,10 @@ fn parse_binding_string(raw: &str) -> Option<ParsedBinding> {
 
 pub fn format_key_combo(binding: KeyCombo) -> String {
     let (code, modifiers) = binding;
+    if code == KeyCode::Modifier(ModifierKeyCode::LeftAlt) && modifiers == KeyModifiers::ALT {
+        return "alt".to_string();
+    }
+
     let mut parts = Vec::new();
     if modifiers.contains(KeyModifiers::CONTROL) {
         parts.push("ctrl".to_string());
@@ -1279,6 +1283,13 @@ fn parse_modifier_combo(s: &str) -> Option<KeyModifiers> {
 }
 
 pub(crate) fn parse_key_combo(s: &str) -> Option<KeyCombo> {
+    if matches!(s.trim().to_lowercase().as_str(), "alt" | "option") {
+        return Some((
+            KeyCode::Modifier(ModifierKeyCode::LeftAlt),
+            KeyModifiers::ALT,
+        ));
+    }
+
     let parts: Vec<&str> = s.split('+').collect();
     let mut modifiers = KeyModifiers::empty();
     let mut key_str: Option<&str> = None;
@@ -1608,6 +1619,26 @@ prefix = "ö"
             config.prefix_keys(),
             vec![(KeyCode::Char('ö'), KeyModifiers::empty())]
         );
+        assert!(config.collect_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn modifier_only_alt_prefix_config_is_valid() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+prefix = "alt"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.prefix_keys(),
+            vec![(
+                KeyCode::Modifier(ModifierKeyCode::LeftAlt),
+                KeyModifiers::ALT,
+            )]
+        );
+        assert_eq!(format_key_combo(config.prefix_keys()[0]), "alt");
         assert!(config.collect_diagnostics().is_empty());
     }
 

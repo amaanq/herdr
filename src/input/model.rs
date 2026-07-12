@@ -266,6 +266,18 @@ pub fn ime_compatible_keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
 }
 
+#[cfg(not(windows))]
+pub fn prefix_keyboard_enhancement_flags(report_all_keys: bool) -> KeyboardEnhancementFlags {
+    let mut flags = ime_compatible_keyboard_enhancement_flags();
+    // Modifier-only bindings (prefix = "alt") exist as key events only under
+    // the kitty report-all-keys flag; it stays off otherwise because it
+    // breaks IME composition on some terminals.
+    if report_all_keys {
+        flags |= KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES;
+    }
+    flags
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModifyOtherKeysMode {
     Mode1,
@@ -513,6 +525,13 @@ mod tests {
         assert!(flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
         assert!(flags.contains(KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
         assert!(!flags.contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn modifier_only_prefixes_request_all_keys_as_escape_codes() {
+        assert!(prefix_keyboard_enhancement_flags(true)
+            .contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
     }
 
     #[test]

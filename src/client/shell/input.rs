@@ -79,10 +79,39 @@ fn push_host_theme_update(
 
 impl ClientShellState {
     pub(crate) fn host_keyboard_report_all_requested(&self) -> bool {
+        if self
+            .config
+            .keybinds
+            .prefix
+            .iter()
+            .any(|(code, _)| matches!(code, KeyCode::Modifier(_)))
+        {
+            return true;
+        }
         matches!(
             self.mode,
             ClientShellMode::Prefix | ClientShellMode::Navigate
         )
+    }
+
+    fn prefix_modifier_stripped_key(
+        &self,
+        key: crate::input::TerminalKey,
+    ) -> Option<crate::input::TerminalKey> {
+        let prefix_mods = self
+            .config
+            .keybinds
+            .prefix
+            .iter()
+            .find(|(code, mods)| {
+                matches!(code, KeyCode::Modifier(_))
+                    && !mods.is_empty()
+                    && key.modifiers.intersects(*mods)
+            })
+            .map(|(_, mods)| *mods)?;
+        let mut stripped = key;
+        stripped.modifiers -= prefix_mods;
+        Some(stripped)
     }
 
     #[cfg(test)]
@@ -596,6 +625,15 @@ impl ClientShellState {
                 }
                 if let Some(binding) =
                     crate::input::resolve_prefix_binding(&self.config.keybinds.keybinds, key)
+                        .or_else(|| {
+                            self.prefix_modifier_stripped_key(key.clone())
+                                .and_then(|stripped| {
+                                    crate::input::resolve_prefix_binding(
+                                        &self.config.keybinds.keybinds,
+                                        &stripped,
+                                    )
+                                })
+                        })
                 {
                     self.mode = return_mode;
                     outcome.repaint = true;
