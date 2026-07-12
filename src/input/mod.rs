@@ -16,6 +16,8 @@ pub(crate) use keybindings::{
 pub(crate) use lease::{InputLease, InputLeaseKey, InputLeaseTable, RepeatPlan};
 #[cfg(not(windows))]
 pub use model::ime_compatible_keyboard_enhancement_flags;
+#[cfg(not(windows))]
+pub use model::prefix_keyboard_enhancement_flags;
 pub use model::WindowsKeyRecord;
 pub use model::{
     host_modify_other_keys_mode, KeyIdentity, KeyboardProtocol, TerminalKey, TextCommit,

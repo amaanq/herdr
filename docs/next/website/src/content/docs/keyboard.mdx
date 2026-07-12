@@ -97,6 +97,8 @@ Every binding is configurable, including the prefix itself:
 prefix = "ctrl+a"
 ```
 
+Terminals with the enhanced keyboard protocol can use left Alt/Option by itself with `prefix = "alt"`. Right Alt remains available for AltGr input, and legacy terminal input cannot report a standalone modifier key.
+
 ## Going prefix-free
 
 You can bind Herdr actions to direct chords that need no prefix at all. The hard part is knowing which chords are safe, because terminals, shells, and desktop environments already own most of the keyboard.
