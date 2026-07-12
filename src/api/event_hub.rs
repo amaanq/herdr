@@ -1,6 +1,12 @@
 #[derive(Clone, Default)]
 pub struct EventHub {
-    inner: std::sync::Arc<std::sync::Mutex<EventHubState>>,
+    inner: std::sync::Arc<EventHubShared>,
+}
+
+#[derive(Default)]
+struct EventHubShared {
+    state: std::sync::Mutex<EventHubState>,
+    pushed: std::sync::Condvar,
 }
 
 #[derive(Default)]
@@ -19,7 +25,7 @@ impl EventHub {
     const MAX_EVENTS: usize = 512;
 
     pub fn push(&self, event: crate::api::schema::EventEnvelope) {
-        let Ok(mut state) = self.inner.lock() else {
+        let Ok(mut state) = self.inner.state.lock() else {
             return;
         };
         state.next_sequence += 1;
@@ -29,10 +35,12 @@ impl EventHub {
         if overflow > 0 {
             state.events.drain(0..overflow);
         }
+        drop(state);
+        self.inner.pushed.notify_all();
     }
 
     pub fn events_after(&self, sequence: u64) -> Vec<(u64, crate::api::schema::EventEnvelope)> {
-        let Ok(state) = self.inner.lock() else {
+        let Ok(state) = self.inner.state.lock() else {
             return Vec::new();
         };
         state
@@ -49,6 +57,7 @@ impl EventHub {
     ) -> Result<Vec<(u64, crate::api::schema::EventEnvelope)>, EventHistoryError> {
         let state = self
             .inner
+            .state
             .lock()
             .map_err(|_| EventHistoryError::Unavailable)?;
         if state
@@ -67,10 +76,30 @@ impl EventHub {
     }
 
     pub fn current_sequence(&self) -> u64 {
-        let Ok(state) = self.inner.lock() else {
+        let Ok(state) = self.inner.state.lock() else {
             return 0;
         };
         state.next_sequence
+    }
+
+    /// Block until an event newer than `sequence` is pushed, or `timeout`
+    /// elapses. Lets subscription streams deliver events push-driven instead
+    /// of paying the poll interval as latency on every user-visible action.
+    pub fn wait_for_events_past(&self, sequence: u64, timeout: std::time::Duration) -> bool {
+        let Ok(state) = self.inner.state.lock() else {
+            return false;
+        };
+        if state.next_sequence > sequence {
+            return true;
+        }
+        let Ok((state, _)) = self
+            .inner
+            .pushed
+            .wait_timeout_while(state, timeout, |state| state.next_sequence <= sequence)
+        else {
+            return false;
+        };
+        state.next_sequence > sequence
     }
 }
 
@@ -86,6 +115,40 @@ mod tests {
                 workspace_id: "workspace_1".into(),
             },
         }
+    }
+
+    #[test]
+    fn wait_returns_immediately_when_events_already_buffered() {
+        let hub = EventHub::default();
+        let before = hub.current_sequence();
+        hub.push(event());
+
+        assert!(hub.wait_for_events_past(before, std::time::Duration::from_millis(0)));
+    }
+
+    #[test]
+    fn wait_times_out_without_new_events() {
+        let hub = EventHub::default();
+        let now = hub.current_sequence();
+
+        assert!(!hub.wait_for_events_past(now, std::time::Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn push_wakes_waiting_stream() {
+        let hub = EventHub::default();
+        let sequence = hub.current_sequence();
+        let waiter = {
+            let hub = hub.clone();
+            std::thread::spawn(move || {
+                hub.wait_for_events_past(sequence, std::time::Duration::from_secs(5))
+            })
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        hub.push(event());
+
+        assert!(waiter.join().expect("waiter thread"));
     }
 
     #[test]
@@ -115,7 +178,7 @@ mod tests {
     fn checked_history_reports_unavailable_instead_of_empty_after_poison() {
         let hub = EventHub::default();
         assert!(std::panic::catch_unwind(|| {
-            let _guard = hub.inner.lock().unwrap();
+            let _guard = hub.inner.state.lock().unwrap();
             panic!("poison the test event history");
         })
         .is_err());

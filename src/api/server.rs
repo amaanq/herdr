@@ -925,6 +925,7 @@ fn stream_subscriptions(
             return Ok(());
         }
 
+        let hub_sequence_before_polls = event_hub.current_sequence();
         for subscription in &mut subscriptions {
             let events = match subscription.poll_batch(api_tx, event_hub) {
                 Ok(events) => events,
@@ -951,7 +952,9 @@ fn stream_subscriptions(
                 }
             }
         }
-        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+        // Hub pushes wake the stream immediately; the timeout only paces the
+        // snapshot-driven subscriptions and the connection liveness check.
+        event_hub.wait_for_events_past(hub_sequence_before_polls, CONNECTION_POLL_INTERVAL);
     }
 }
 
