@@ -207,6 +207,8 @@ pub enum Method {
     PaneReportAgentSession(PaneReportAgentSessionParams),
     #[serde(rename = "pane.report_nested_terminal")]
     PaneReportNestedTerminal(PaneReportNestedTerminalParams),
+    #[serde(rename = "pane.take_nested_sessions")]
+    PaneTakeNestedSessions(PaneTarget),
     #[serde(rename = "pane.report_metadata")]
     PaneReportMetadata(PaneReportMetadataParams),
     #[serde(rename = "pane.clear_agent_authority")]

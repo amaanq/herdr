@@ -378,6 +378,30 @@ pub struct PaneReportAgentParams {
     pub resume_argv: Option<Vec<String>>,
 }
 
+/// A nested agent session ready to resume, with the agent's native resume
+/// command already composed by the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct NestedSessionResume {
+    pub agent: String,
+    pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
+    /// Directory the agent ran in. Claude Code and codex look sessions up
+    /// per project directory, so a resume from anywhere else misses one
+    /// recorded in a subdirectory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Variables that pin the agent to the account it ran under.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<NestedSessionEnv>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct NestedSessionEnv {
+    pub name: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneReportNestedTerminalParams {
     pub pane_id: String,
@@ -396,6 +420,10 @@ pub struct PaneReportNestedTerminalParams {
     /// Whether the editor currently displays this terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visible: Option<bool>,
+    /// Slot this terminal occupies in the editor's numbered terminals, so a
+    /// later restore can put its agent back in the same one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
     #[serde(default)]
     pub closed: bool,
 }

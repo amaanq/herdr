@@ -270,6 +270,13 @@ pub struct SessionConfig {
     pub resume_agents_on_restore: bool,
     /// Milliseconds between automatic agent restores. Zero disables spacing.
     pub startup_per_agent_delay_ms: u32,
+    /// Relaunch commands for restored panes by foreground program name, e.g.
+    /// nvim = ["nvim", "+lua require(\"persistence\").load()"]. A restored
+    /// pane whose foreground program matches gets the command typed into its
+    /// shell, like agent resume; parts containing single quotes break under
+    /// non-POSIX shells (nushell), so prefer double quotes inside arguments.
+    /// Unmatched programs restore as plain shells.
+    pub restore_commands: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Default for SessionConfig {
@@ -277,6 +284,7 @@ impl Default for SessionConfig {
         Self {
             resume_agents_on_restore: true,
             startup_per_agent_delay_ms: 100,
+            restore_commands: std::collections::HashMap::new(),
         }
     }
 }

@@ -181,6 +181,9 @@ pub enum ResponseResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         current_global: Option<u64>,
     },
+    NestedSessions {
+        sessions: Vec<super::panes::NestedSessionResume>,
+    },
     AgentExplain {
         explain: serde_json::Value,
     },

@@ -126,6 +126,7 @@ pub enum AppEvent {
         text: String,
         title: String,
         visible: Option<bool>,
+        slot: Option<u32>,
         closed: bool,
     },
     /// Agent session identity was reported without state authority.
