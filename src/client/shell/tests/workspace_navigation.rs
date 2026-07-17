@@ -568,17 +568,9 @@ fn aggregate_navigation_reveals_overflow_and_preserves_order() {
         }
         assert!(!state.collapsed_endpoints.contains(&remote_id));
         preview_key(&mut state, b"\x1b[B");
-        if cols == 44 {
-            assert_selected(&state, &remote_id, "ws_15");
-        } else {
-            assert_selected(&state, &ClientEndpointId::Local, "ws_1");
-        }
+        assert_selected(&state, &ClientEndpointId::Local, "ws_1");
         preview_key(&mut state, b"\x1b[A");
-        assert_selected(
-            &state,
-            &remote_id,
-            if cols == 44 { "ws_14" } else { "ws_15" },
-        );
+        assert_selected(&state, &remote_id, "ws_15");
         state.set_endpoint_status(&remote_id, ClientEndpointStatus::Reconnecting);
         preview_key(&mut state, b"\x1b[B");
         assert_selected(&state, &ClientEndpointId::Local, "ws_1");

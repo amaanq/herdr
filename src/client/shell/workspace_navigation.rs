@@ -145,9 +145,6 @@ impl ClientShellState {
             .as_ref()
             .and_then(|selected| targets.iter().position(|target| target == selected));
         let next = match current {
-            Some(current) if mobile => {
-                (current as isize + delta).clamp(0, targets.len() as isize - 1) as usize
-            }
             Some(current) => (current as isize + delta).rem_euclid(targets.len() as isize) as usize,
             None if delta < 0 => targets.len() - 1,
             None => 0,
