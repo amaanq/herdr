@@ -294,11 +294,10 @@ impl App {
         #[cfg(windows)]
         {
             if !params.force
-                && crate::worktree::checkout_has_dirty_files(
+                && crate::worktree::worktree_remove_discards_uncommitted_files(
                     &space.checkout_path,
                     params.trust_repository,
                 )
-                .unwrap_or(false)
             {
                 Self::send_api_response(
                     respond_to,
@@ -357,12 +356,6 @@ impl App {
             .insert(checkout_key.clone(), operation_id);
         let workspace_snapshot = self.workspace_info(ws_idx);
         let worktree = self.worktree_info_for_membership(&space, None);
-        let command = crate::worktree::build_worktree_remove_command(
-            &space.repo_root,
-            &space.checkout_path,
-            params.force,
-            params.trust_repository,
-        );
         let api_request = ApiWorktreeRemoveRequest {
             id,
             operation_id,
@@ -386,8 +379,7 @@ impl App {
             "herdr-worktree-remove",
             finished,
             move |mut finished| {
-                finished.result = crate::worktree::run_worktree_remove_command_with_recovery(
-                    &command,
+                finished.result = crate::worktree::run_worktree_remove(
                     &repo_root,
                     &finished.path,
                     finished.forced,

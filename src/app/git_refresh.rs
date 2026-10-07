@@ -338,6 +338,7 @@ mod tests {
     fn shared_root_repo_refresh_keeps_workspace_specific_fallback_labels() {
         let cache_key = PathBuf::from("/");
         let cached = GitStatusCacheEntry {
+            jj: None,
             fingerprint: None,
             retry_after: Some(Instant::now() + std::time::Duration::from_secs(30)),
             snapshot: crate::workspace::WorkspaceGitStatusSnapshot {
@@ -427,6 +428,7 @@ mod tests {
         assert_eq!(items[0].cache_key_hint, None);
         let cache_key = items[0].resolved_identity_cwd.clone();
         let cached = GitStatusCacheEntry {
+            jj: None,
             fingerprint: None,
             retry_after: None,
             snapshot: crate::workspace::WorkspaceGitStatusSnapshot {

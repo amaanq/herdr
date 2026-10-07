@@ -1,3 +1,5 @@
+mod jj;
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -313,7 +315,11 @@ pub(crate) fn run_worktree_add_command(
     base: &str,
     trust_repository: bool,
 ) -> Result<(), String> {
-    let command = if local_branch_exists(repo_root, branch, trust_repository)? {
+    let branch_exists = local_branch_exists(repo_root, branch, trust_repository)?;
+    if jj::is_workspace(repo_root) {
+        return jj::add_workspace(repo_root, path, branch, branch_exists, base);
+    }
+    let command = if branch_exists {
         build_worktree_add_existing_branch_command(repo_root, path, branch, trust_repository)
     } else {
         build_worktree_add_new_branch_command(repo_root, path, branch, base, trust_repository)
@@ -343,7 +349,31 @@ pub(crate) fn run_worktree_command(command: &WorktreeCommand) -> Result<(), Stri
     })
 }
 
-pub(crate) fn run_worktree_remove_command_with_recovery(
+/// Removes the checkout at `path`, through jj when it is a jj workspace.
+pub(crate) fn run_worktree_remove(
+    repo_root: &Path,
+    path: &Path,
+    force: bool,
+    trust_repository: bool,
+) -> Result<(), String> {
+    if jj::is_workspace(path) {
+        return jj::remove_workspace(path, force);
+    }
+    let command = build_worktree_remove_command(repo_root, path, force, trust_repository);
+    run_worktree_remove_command_with_recovery(&command, repo_root, path, force, trust_repository)
+}
+
+/// jj snapshots the working copy before forgetting a workspace, so only Git
+/// removals can discard uncommitted files.
+#[cfg(windows)]
+pub(crate) fn worktree_remove_discards_uncommitted_files(
+    path: &Path,
+    trust_repository: bool,
+) -> bool {
+    !jj::is_workspace(path) && checkout_has_dirty_files(path, trust_repository).unwrap_or(false)
+}
+
+fn run_worktree_remove_command_with_recovery(
     command: &WorktreeCommand,
     repo_root: &Path,
     path: &Path,
@@ -465,12 +495,12 @@ pub(crate) fn parse_worktree_list_porcelain(output: &str) -> Vec<ExistingWorktre
         if let Some(value) = line.strip_prefix("worktree ") {
             path = Some(PathBuf::from(value));
         } else if let Some(value) = line.strip_prefix("branch ") {
-            branch = Some(
-                value
-                    .strip_prefix("refs/heads/")
-                    .unwrap_or(value)
-                    .to_string(),
-            );
+            // HEAD can also be a symbolic ref outside refs/heads, such as the
+            // refs/jj/root placeholder in a fresh colocated jj workspace.
+            match value.strip_prefix("refs/heads/") {
+                Some(name) => branch = Some(name.to_string()),
+                None => is_detached = true,
+            }
         } else if line == "detached" {
             is_detached = true;
         } else if line == "bare" {

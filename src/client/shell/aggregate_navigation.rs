@@ -328,7 +328,10 @@ pub(super) fn navigator_rows(
                     .or_insert_with(Vec::new)
                     .push(pane);
             }
-            for workspace in &snapshot.workspaces {
+            // Same order and nesting as the sidebar, with every group expanded.
+            for entry in sidebar::workspace_entries(snapshot, &HashSet::new()) {
+                let workspace = &snapshot.workspaces[entry.index];
+                let workspace_depth = depth_offset + u8::from(entry.indented);
                 let workspace_matches = endpoint_query_matches
                     || text(&workspace.label)
                     || workspace.branch.as_deref().is_some_and(text);
@@ -400,7 +403,7 @@ pub(super) fn navigator_rows(
                                 || text(&pane.pane_id))
                         {
                             children.push(ClientNavigatorRow {
-                                depth: 1 + depth_offset,
+                                depth: workspace_depth + 1,
                                 label,
                                 meta: meta.to_owned(),
                                 detail: format!(
@@ -425,7 +428,7 @@ pub(super) fn navigator_rows(
                     || (navigator.filter.is_none() && !query.is_empty() && workspace_matches)
                 {
                     endpoint_rows.push(ClientNavigatorRow {
-                        depth: depth_offset,
+                        depth: workspace_depth,
                         label: workspace.label.clone(),
                         meta: workspace.branch.clone().unwrap_or_default(),
                         detail: workspace.new_workspace_cwd.clone(),

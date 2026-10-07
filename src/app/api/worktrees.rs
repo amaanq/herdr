@@ -232,7 +232,13 @@ impl App {
                 "workspace not found",
             ));
         };
-        if let Some(membership) = ws.worktree_space() {
+        // Membership is provenance and survives moving around its repository,
+        // but not a move into another repository.
+        let membership = ws.worktree_space().filter(|membership| {
+            ws.git_space()
+                .is_none_or(|space| space.key == membership.key)
+        });
+        if let Some(membership) = membership {
             if membership.is_linked_worktree {
                 return Err(ApiFailure::new(
                     "linked_worktree_source",

@@ -2,6 +2,7 @@ mod config;
 #[cfg(test)]
 mod config_tests;
 mod discovery;
+mod jj;
 mod status;
 #[cfg(test)]
 pub(super) mod test_support;

@@ -11,6 +11,7 @@ use super::{
         git_symbolic_head_full, git_worktree_info, read_git_ref_file, read_ref_oid,
         GitWorktreeInfo,
     },
+    jj::{jj_status, JjStatusCache},
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -36,6 +37,7 @@ pub struct GitStatusCacheEntry {
     pub fingerprint: Option<GitStatusFingerprint>,
     pub retry_after: Option<Instant>,
     pub snapshot: WorkspaceGitStatusSnapshot,
+    pub jj: Option<JjStatusCache>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +104,33 @@ pub fn git_status_snapshot_for_cwd_with_demand(
     cached: Option<&GitStatusCacheEntry>,
     demand: GitStatusRefreshDemand,
 ) -> (WorkspaceGitStatusSnapshot, Option<GitStatusCacheEntry>) {
+    let (mut snapshot, entry) = git_snapshot_for_cwd(cwd, cached, demand);
+    // A fresh jj workspace's HEAD is the unresolved `refs/jj/root`, so Git
+    // yields no cache entry, yet jj still knows its status.
+    let Some(jj) = snapshot
+        .space
+        .as_ref()
+        .and_then(|space| jj_status(space, cached.and_then(|cached| cached.jj.as_ref()), demand))
+    else {
+        return (snapshot, entry);
+    };
+    jj.apply(&mut snapshot);
+    let (fingerprint, retry_after) =
+        entry.map_or((None, None), |entry| (entry.fingerprint, entry.retry_after));
+    let entry = GitStatusCacheEntry {
+        fingerprint,
+        retry_after,
+        snapshot: snapshot.clone(),
+        jj: Some(jj),
+    };
+    (snapshot, Some(entry))
+}
+
+fn git_snapshot_for_cwd(
+    cwd: &Path,
+    cached: Option<&GitStatusCacheEntry>,
+    demand: GitStatusRefreshDemand,
+) -> (WorkspaceGitStatusSnapshot, Option<GitStatusCacheEntry>) {
     if let Some(cached) = cached.filter(|entry| {
         entry.fingerprint.is_none()
             && entry
@@ -129,6 +158,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
                 fingerprint: None,
                 retry_after: Some(Instant::now() + Duration::from_secs(30)),
                 snapshot,
+                jj: None,
             }),
         );
     };
@@ -154,6 +184,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
                 fingerprint: Some(fingerprint),
                 retry_after: None,
                 snapshot,
+                jj: None,
             }),
         );
     }
@@ -184,6 +215,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
                 fingerprint: Some(fingerprint),
                 retry_after: None,
                 snapshot,
+                jj: None,
             }),
         );
     }
@@ -204,6 +236,7 @@ pub fn git_status_snapshot_for_cwd_with_demand(
             fingerprint: Some(fingerprint),
             retry_after: None,
             snapshot,
+            jj: None,
         }),
     )
 }
@@ -453,6 +486,7 @@ mod tests {
         write_fake_tracked_repo(&root);
         let fingerprint = git_status_fingerprint(&root).unwrap();
         let cached = GitStatusCacheEntry {
+            jj: None,
             fingerprint: Some(fingerprint),
             retry_after: None,
             snapshot: WorkspaceGitStatusSnapshot {
@@ -478,6 +512,7 @@ mod tests {
         write_fake_tracked_repo(&root);
         let fingerprint = git_status_fingerprint(&root).unwrap();
         let cached = GitStatusCacheEntry {
+            jj: None,
             fingerprint: Some(fingerprint),
             retry_after: None,
             snapshot: WorkspaceGitStatusSnapshot {
@@ -513,6 +548,7 @@ mod tests {
         write_fake_tracked_repo(&root);
         let fingerprint = git_status_fingerprint(&root).unwrap();
         let cached = GitStatusCacheEntry {
+            jj: None,
             fingerprint: Some(fingerprint),
             retry_after: None,
             snapshot: WorkspaceGitStatusSnapshot {

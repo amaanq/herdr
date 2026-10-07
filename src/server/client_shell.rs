@@ -93,6 +93,19 @@ pub(super) fn snapshot_with_completions(
                         key: worktree.repo_key,
                         label: worktree.repo_name,
                         is_linked_worktree: worktree.is_linked_worktree,
+                    })
+                    // A primary checkout with a detached HEAD, as in a
+                    // colocated jj repo, has no branch, so expose its Git
+                    // space to keep worktree actions available.
+                    .or_else(|| {
+                        state
+                            .git_space()
+                            .filter(|space| !space.is_linked_worktree)
+                            .map(|space| protocol::ClientShellWorktree {
+                                key: space.key.clone(),
+                                label: space.repo_name.clone(),
+                                is_linked_worktree: false,
+                            })
                     }),
                 agent_status: workspace.agent_status,
             }
