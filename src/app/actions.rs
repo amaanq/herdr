@@ -1381,6 +1381,10 @@ impl AppState {
                 ws.cached_git_ahead_behind = result.ahead_behind;
                 changed = true;
             }
+            if result.demand.ahead_behind && ws.cached_git_conflicted != result.conflicted {
+                ws.cached_git_conflicted = result.conflicted;
+                changed = true;
+            }
             if ws.cached_git_space != result.space {
                 ws.cached_git_space = result.space;
                 changed = true;
@@ -2669,6 +2673,7 @@ mod tests {
                 auto_label: "one".into(),
                 branch: Some("main".into()),
                 ahead_behind: Some((2, 1)),
+                conflicted: false,
                 space: None,
             }],
         );
@@ -2738,6 +2743,7 @@ mod tests {
                 auto_label: "stale".into(),
                 branch: Some("main".into()),
                 ahead_behind: Some((0, 1)),
+                conflicted: false,
                 space: None,
             }],
         );
@@ -2769,6 +2775,7 @@ mod tests {
                 auto_label: "one".into(),
                 branch: Some("new".into()),
                 ahead_behind: None,
+                conflicted: false,
                 space: None,
             }],
         );
@@ -2796,6 +2803,7 @@ mod tests {
                 auto_label: "one".into(),
                 branch: None,
                 ahead_behind: None,
+                conflicted: false,
                 space: None,
             }],
         );
@@ -2824,6 +2832,7 @@ mod tests {
                 auto_label: "other".into(),
                 branch: Some("scratch".into()),
                 ahead_behind: None,
+                conflicted: false,
                 space: Some(crate::workspace::GitSpaceMetadata {
                     key: "other-repo-key".into(),
                     checkout_key: "/other/checkout".into(),

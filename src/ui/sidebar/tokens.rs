@@ -20,7 +20,11 @@ pub(crate) enum ResolvedTokenKind {
     Agent(String),
     TerminalTitle(String),
     Branch(String),
-    GitStatus { ahead: usize, behind: usize },
+    GitStatus {
+        ahead: usize,
+        behind: usize,
+        conflicted: bool,
+    },
     Custom(String),
 }
 
@@ -126,6 +130,7 @@ pub(crate) struct SpaceTokenContext<'a> {
     pub(crate) branch: Option<&'a str>,
     pub(crate) state_text: &'a str,
     pub(crate) ahead_behind: Option<(usize, usize)>,
+    pub(crate) conflicted: bool,
     pub(crate) tokens: &'a std::collections::HashMap<String, String>,
     pub(crate) suppress_git_details: bool,
 }
@@ -154,11 +159,20 @@ pub(crate) fn space_rows(
                             .branch
                             .map(|branch| ResolvedTokenKind::Branch(branch.to_string())),
                         SpaceSidebarToken::Branch => None,
-                        SpaceSidebarToken::GitStatus if !context.suppress_git_details => context
-                            .ahead_behind
-                            .filter(|(ahead, behind)| *ahead > 0 || *behind > 0)
-                            .map(|(ahead, behind)| ResolvedTokenKind::GitStatus { ahead, behind }),
-                        SpaceSidebarToken::GitStatus => None,
+                        SpaceSidebarToken::GitStatus => {
+                            // A conflict still shows where indentation hides the counts.
+                            let (ahead, behind) = context
+                                .ahead_behind
+                                .filter(|_| !context.suppress_git_details)
+                                .unwrap_or_default();
+                            (ahead > 0 || behind > 0 || context.conflicted).then_some(
+                                ResolvedTokenKind::GitStatus {
+                                    ahead,
+                                    behind,
+                                    conflicted: context.conflicted,
+                                },
+                            )
+                        }
                         SpaceSidebarToken::Custom(name) => context
                             .tokens
                             .get(name)
@@ -330,6 +344,7 @@ rows = [[{ token = "$load", rules = [{ lt = 50, dim = true }] }]]
                     branch: None,
                     state_text: "working",
                     ahead_behind: None,
+                    conflicted: false,
                     suppress_git_details: false,
                     tokens: &entry.tokens,
                 },
@@ -379,6 +394,7 @@ rows = [[{ token = "$load", rules = [{ lt = 50, hide = true }] }], ["workspace"]
                     branch: None,
                     state_text: "working",
                     ahead_behind: None,
+                    conflicted: false,
                     suppress_git_details: false,
                     tokens: &entry.tokens,
                 },
@@ -548,6 +564,7 @@ rows = [[{ token = "$load", rules = [{ lt = 50, hide = true }] }], ["workspace"]
                     branch: Some("worktree/feature"),
                     state_text: "idle",
                     ahead_behind: Some((2, 1)),
+                    conflicted: false,
                     tokens: &std::collections::HashMap::new(),
                     suppress_git_details: true,
                 },
@@ -575,6 +592,7 @@ rows = [[{ token = "$load", rules = [{ lt = 50, hide = true }] }], ["workspace"]
                     branch: None,
                     state_text: "idle",
                     ahead_behind: None,
+                    conflicted: false,
                     tokens: &tokens,
                     suppress_git_details: false,
                 },

@@ -1200,6 +1200,7 @@ mod tests {
                 auto_label: "one".into(),
                 branch: Some("render-dirty-test".into()),
                 ahead_behind: Some((1, 0)),
+                conflicted: false,
                 space: None,
             }],
             cache_updates: Vec::new(),

@@ -1027,6 +1027,8 @@ pub struct ClientShellWorkspace {
     pub custom_label: bool,
     pub branch: Option<String>,
     pub git_ahead_behind: Option<(usize, usize)>,
+    #[serde(default)]
+    pub git_conflicted: bool,
     pub tokens: Vec<(String, String)>,
     pub worktree: Option<ClientShellWorktree>,
     pub focused: bool,
@@ -2826,6 +2828,7 @@ mod tests {
                 custom_label: false,
                 branch: Some("main".into()),
                 git_ahead_behind: None,
+                git_conflicted: false,
                 tokens: Vec::new(),
                 worktree: None,
                 focused: true,

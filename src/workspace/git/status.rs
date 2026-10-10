@@ -150,6 +150,7 @@ fn git_snapshot_for_cwd(
             auto_label: fallback_label_from_cwd(cwd),
             branch: None,
             ahead_behind: None,
+            conflicted: false,
             space: None,
         };
         return (
@@ -176,6 +177,7 @@ fn git_snapshot_for_cwd(
             auto_label,
             branch,
             ahead_behind: None,
+            conflicted: false,
             space: Some(space),
         };
         return (
@@ -195,6 +197,7 @@ fn git_snapshot_for_cwd(
                 auto_label,
                 branch: None,
                 ahead_behind: None,
+                conflicted: false,
                 space: Some(space),
             },
             None,
@@ -207,6 +210,7 @@ fn git_snapshot_for_cwd(
             auto_label,
             branch,
             ahead_behind: cached.snapshot.ahead_behind,
+            conflicted: false,
             space: Some(space),
         };
         return (
@@ -228,6 +232,7 @@ fn git_snapshot_for_cwd(
         auto_label,
         branch,
         ahead_behind,
+        conflicted: false,
         space: Some(space),
     };
     (
@@ -493,6 +498,7 @@ mod tests {
                 auto_label: "repo".into(),
                 branch: Some("main".into()),
                 ahead_behind: Some((2, 1)),
+                conflicted: false,
                 space: git_space_metadata(&root),
             },
         };
@@ -519,6 +525,7 @@ mod tests {
                 auto_label: "repo".into(),
                 branch: Some("main".into()),
                 ahead_behind: Some((4, 0)),
+                conflicted: false,
                 space: git_space_metadata(&root),
             },
         };
@@ -555,6 +562,7 @@ mod tests {
                 auto_label: "repo".into(),
                 branch: Some("main".into()),
                 ahead_behind: Some((0, 3)),
+                conflicted: false,
                 space: git_space_metadata(&root),
             },
         };

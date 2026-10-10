@@ -2,7 +2,7 @@ mod tokens;
 
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::Span,
 };
 
@@ -103,6 +103,22 @@ pub(crate) fn agent_panel_entries_from(
     entries
 }
 
+fn git_status_parts(
+    ahead: usize,
+    behind: usize,
+    conflicted: bool,
+    palette: &Palette,
+) -> Vec<(String, Color)> {
+    [
+        conflicted.then(|| ("!".to_string(), palette.red)),
+        (ahead > 0).then(|| (format!("↑{ahead}"), palette.green)),
+        (behind > 0).then(|| (format!("↓{behind}"), palette.red)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 pub(crate) fn resolved_token_spans(
     resolved: &[ResolvedToken],
     state_icon: (&str, Style),
@@ -117,10 +133,17 @@ pub(crate) fn resolved_token_spans(
         .iter()
         .map(|token| match &token.kind {
             ResolvedTokenKind::StateIcon => display_width(state_icon.0),
-            ResolvedTokenKind::GitStatus { ahead, behind } => {
-                usize::from(*ahead > 0) * display_width(&format!("↑{ahead}"))
-                    + usize::from(*behind > 0) * display_width(&format!("↓{behind}"))
-                    + usize::from(*ahead > 0 && *behind > 0)
+            ResolvedTokenKind::GitStatus {
+                ahead,
+                behind,
+                conflicted,
+            } => {
+                let parts = git_status_parts(*ahead, *behind, *conflicted, palette);
+                parts
+                    .iter()
+                    .map(|(text, _)| display_width(text))
+                    .sum::<usize>()
+                    + parts.len().saturating_sub(1)
             }
             _ => 0,
         })
@@ -243,23 +266,22 @@ pub(crate) fn resolved_token_spans(
                 truncate_end(text, budgets[index]),
                 apply_token_style(secondary_style, token.style),
             )),
-            ResolvedTokenKind::GitStatus { ahead, behind } => {
-                if *ahead > 0 {
+            ResolvedTokenKind::GitStatus {
+                ahead,
+                behind,
+                conflicted,
+            } => {
+                let parts = git_status_parts(*ahead, *behind, *conflicted, palette);
+                for (part_index, (text, color)) in parts.into_iter().enumerate() {
+                    if part_index > 0 {
+                        spans.push(Span::styled(
+                            " ",
+                            apply_token_style(Style::default(), token.style),
+                        ));
+                    }
                     spans.push(Span::styled(
-                        format!("↑{ahead}"),
-                        apply_token_style(Style::default().fg(palette.green), token.style),
-                    ));
-                }
-                if *ahead > 0 && *behind > 0 {
-                    spans.push(Span::styled(
-                        " ",
-                        apply_token_style(Style::default(), token.style),
-                    ));
-                }
-                if *behind > 0 {
-                    spans.push(Span::styled(
-                        format!("↓{behind}"),
-                        apply_token_style(Style::default().fg(palette.red), token.style),
+                        text,
+                        apply_token_style(Style::default().fg(color), token.style),
                     ));
                 }
             }

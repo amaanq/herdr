@@ -683,6 +683,7 @@ pub(in crate::client::shell) fn workspace_rows(
             branch: workspace.branch.as_deref(),
             state_text: status_text(status),
             ahead_behind: workspace.git_ahead_behind,
+            conflicted: workspace.git_conflicted,
             tokens: &token_values,
             suppress_git_details: indented,
         },

@@ -345,6 +345,7 @@ mod tests {
                 auto_label: "/".into(),
                 branch: Some("main".into()),
                 ahead_behind: None,
+                conflicted: false,
                 space: Some(crate::workspace::GitSpaceMetadata {
                     key: "/.git".into(),
                     checkout_key: "/".into(),
@@ -435,6 +436,7 @@ mod tests {
                 auto_label: "stale".into(),
                 branch: None,
                 ahead_behind: None,
+                conflicted: false,
                 space: None,
             },
         };

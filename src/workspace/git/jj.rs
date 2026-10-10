@@ -1,7 +1,8 @@
 //! Status for colocated Jujutsu workspaces. Their Git HEAD is never a branch,
 //! so the branch label and ahead/behind counts come from jj instead: the
 //! label is a bookmark on `@` or `@-`, falling back to the workspace name for
-//! linked workspaces, and the counts compare `@` with `trunk()`.
+//! linked workspaces, and the counts compare `@` with `trunk()`. The same
+//! query flags a conflicted `@`.
 //!
 //! Results are cached on jj's operation heads, which change with every jj
 //! operation. jj runs with `--ignore-working-copy` so a background refresh
@@ -25,9 +26,15 @@ const LABEL_TEMPLATE: &str = concat!(
 );
 
 /// Without a trunk bookmark `trunk()` is the root commit. Restricting ahead to
-/// descendants of a real trunk keeps that from counting all of history.
-const COUNT_REVSET: &str = "((trunk()..@ ~ empty()) & (trunk() ~ root())::) | @..trunk()";
-const COUNT_TEMPLATE: &str = r#"if(self.contained_in("@..trunk()"), "-", "+")"#;
+/// descendants of a real trunk keeps that from counting all of history. A
+/// conflicted `@` is pulled in even when it is neither ahead nor behind.
+const COUNT_REVSET: &str =
+    "((trunk()..@ ~ empty()) & (trunk() ~ root())::) | @..trunk() | (@ & conflicts())";
+const COUNT_TEMPLATE: &str = concat!(
+    r#"if(self.contained_in("@..trunk()"), "-") ++ "#,
+    r#"if(self.contained_in("(trunk()..@ ~ empty()) & (trunk() ~ root())::"), "+") ++ "#,
+    r#"if(current_working_copy && conflict, "!")"#,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JjStatusCache {
@@ -35,12 +42,14 @@ pub struct JjStatusCache {
     demand: GitStatusRefreshDemand,
     label: Option<String>,
     ahead_behind: Option<(usize, usize)>,
+    conflicted: bool,
 }
 
 impl JjStatusCache {
     pub(super) fn apply(&self, snapshot: &mut WorkspaceGitStatusSnapshot) {
         snapshot.branch = self.label.clone();
         snapshot.ahead_behind = self.ahead_behind;
+        snapshot.conflicted = self.conflicted;
     }
 }
 
@@ -65,16 +74,18 @@ pub(super) fn jj_status(
         .then(|| jj_log(checkout, LABEL_REVSET, LABEL_TEMPLATE))
         .flatten()
         .and_then(|stdout| parse_label(&stdout, space.is_linked_worktree));
-    let ahead_behind = demand
+    let counts = demand
         .ahead_behind
         .then(|| jj_log(checkout, COUNT_REVSET, COUNT_TEMPLATE))
-        .flatten()
-        .map(|stdout| (stdout.matches('+').count(), stdout.matches('-').count()));
+        .flatten();
     Some(JjStatusCache {
         op_heads,
         demand,
         label,
-        ahead_behind,
+        ahead_behind: counts
+            .as_ref()
+            .map(|stdout| (stdout.matches('+').count(), stdout.matches('-').count())),
+        conflicted: counts.is_some_and(|stdout| stdout.contains('!')),
     })
 }
 
