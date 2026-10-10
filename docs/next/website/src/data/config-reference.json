@@ -1453,6 +1453,12 @@
           "type": "string",
           "default": "\"~/.herdr/worktrees\"",
           "description": "Root directory under which Herdr creates <repo>/<branch-slug> checkouts."
+        },
+        {
+          "key": "worktrees.post_create",
+          "type": "string",
+          "default": "unset",
+          "description": "Shell command typed into the root pane of each newly created worktree."
         }
       ]
     },

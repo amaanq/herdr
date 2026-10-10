@@ -507,6 +507,7 @@ impl App {
             should_quit: false,
             request_client_config_reload: false,
             worktree_directory,
+            worktree_post_create: config.worktrees.post_create.clone(),
             latest_release_notes,
             product_announcement: startup_product_announcement.map(|announcement| {
                 state::ProductAnnouncementState {
@@ -1011,6 +1012,7 @@ impl App {
         if !invalid_section("worktrees") {
             self.state.worktree_directory =
                 crate::worktree::expand_tilde_absolute_path(&config.worktrees.directory);
+            self.state.worktree_post_create = config.worktrees.post_create.clone();
         }
 
         if !invalid_section("theme") {

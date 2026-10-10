@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -479,6 +480,7 @@ impl App {
         self.state.mark_session_dirty();
         if created_workspace {
             self.emit_workspace_open_events(ws_idx);
+            self.submit_worktree_post_create(ws_idx);
         }
         let Some(worktree) = self.worktree_info_for_workspace(ws_idx) else {
             Self::send_api_response(
@@ -507,6 +509,28 @@ impl App {
             },
         );
         Self::send_api_response(api.respond_to, response);
+    }
+
+    /// The command is typed rather than run directly so its output and any
+    /// failure stay in the pane, and it runs in the user's shell environment.
+    fn submit_worktree_post_create(&self, ws_idx: usize) {
+        let Some(command) = self
+            .state
+            .worktree_post_create
+            .as_deref()
+            .filter(|command| !command.trim().is_empty())
+        else {
+            return;
+        };
+        let Some(runtime) = self.state.workspaces[ws_idx]
+            .focused_pane_id()
+            .and_then(|pane_id| self.lookup_runtime_sender(ws_idx, pane_id))
+        else {
+            return;
+        };
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(format!("{command}\r"))) {
+            tracing::warn!(%err, "failed to submit worktree post_create command");
+        }
     }
 
     pub(crate) fn handle_api_worktree_remove_finished(

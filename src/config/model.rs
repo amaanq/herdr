@@ -878,6 +878,8 @@ pub struct IndexedKeysConfig {
 pub struct WorktreesConfig {
     /// Root directory under which Herdr creates <repo>/<branch-slug> checkouts.
     pub directory: String,
+    /// Shell command typed into the root pane of each newly created worktree.
+    pub post_create: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -1199,6 +1201,7 @@ impl Default for WorktreesConfig {
     fn default() -> Self {
         Self {
             directory: "~/.herdr/worktrees".into(),
+            post_create: None,
         }
     }
 }
